@@ -37,8 +37,8 @@
 //  config.js" and offer a Test connection button, which does a real read and
 //  write and reports back in plain words.
 
-window.PUTTING_DB = "";
-window.PUTTING_HEADERS = {};
+window.PUTTING_DB = "https://api.jsonbin.io/v3/b/6a7c8de4da38895dfedb2d80";
+window.PUTTING_HEADERS = { "X-Master-Key": "$2a$10$6hHqWKyig.0QrQgoivIYhu0vQbaYvlHHPb18d5bpo0Gz6T3xvhs6O" };
 
 //  Notes
 //  • The key above is visible to anyone who views your site's source. For a
