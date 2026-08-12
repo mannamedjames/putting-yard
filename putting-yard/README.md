@@ -10,6 +10,7 @@ device. No account, no server, no network needed once it's installed.
 | `index.html` | The whole app — code, styles, everything, in one file |
 | `manifest.webmanifest` | Tells your phone the app's name and icon |
 | `sw.js` | Service worker; makes the app work offline |
+| `config.js` | Where you paste your shared-database URL |
 | `icon-*.png`, `apple-touch-icon.png` | Home screen icons |
 
 ## Getting it on your phone
@@ -53,45 +54,34 @@ climb one flag per round, a perfect run is 120 points. Finished runs are ranked
 on a leaderboard. Change the leaderboard name on the home screen before handing
 your phone to someone else and you'll both appear on the board.
 
-## Cloud sync (recommended on iPhone)
+## Shared data across devices (set up once, then nothing)
 
-iOS can evict a web app's local data, which is how a session disappears an hour
-after you logged it. The app now stores everything in two places on the device
-(IndexedDB plus a localStorage mirror), and can also sync to a GitHub repo so
-your history survives a wipe or a new phone entirely.
+Every device that opens the app can read and write one shared set of sessions
+and runs — no accounts, no tokens, nothing to enter on each phone. You set the
+address once, in `config.js`, and it ships with the app.
 
-Setting it up takes about three minutes:
+Getting a free database, about five minutes, one time:
 
-1. On GitHub, create a **second, private** repository — e.g. `putting-data`.
-   Keep it separate from the public one hosting the app, so your history isn't
-   public. Tick "Add a README file" so the repo isn't empty.
-2. Go to **Settings → Developer settings → Personal access tokens →
-   Fine-grained tokens → Generate new token**.
-   - Expiration: whatever you like (you'll re-enter it when it lapses).
-   - Repository access: **Only select repositories** → pick `putting-data`.
-   - Permissions: **Repository permissions → Contents → Read and write**.
-   - Generate, then copy the `github_pat_...` string.
-3. In the app, open the **Cloud sync** card at the bottom of the home screen,
-   tap **Set up cloud sync**, and enter your GitHub username, the repo name
-   (`putting-data`), and the token. Tap **Connect and sync**.
+1. Go to console.firebase.google.com and click **Create a project**. Name it
+   anything; turn off Google Analytics when offered.
+2. In the sidebar: **Build → Realtime Database → Create Database**. Pick any
+   location. When it asks about security rules, choose **Start in test mode**.
+3. Copy the URL at the top of the Data tab. It looks like
+   `https://your-project-default-rtdb.firebaseio.com`
+4. Open `config.js` in your repo, paste the URL between the quotes on the
+   `window.PUTTING_DB` line, and commit.
 
-After that it syncs automatically whenever you finish a session or a game, and
-pulls on open. There's a **Sync now** button for a manual push.
+That's it. Every device that loads the app now syncs to the same data — pulls
+when you open it, pushes when a session or run finishes, plus a **Sync now**
+button. The home screen shows "Shared data · on" when it's working.
 
-The token is stored on your device only and is never written into the repo.
-It can only touch that one private repo, so the worst case if it leaked is
-someone editing your putting stats. If you ever want it dead, delete the token
-on GitHub and tap Disconnect in the app.
+Test mode expires after 30 days. When it does, go to the database's **Rules**
+tab and set both `.read` and `.write` to `true` to keep it open. That leaves the
+database readable by anyone who knows the URL, which is the trade for having no
+login at all — fine for putting stats, not for anything private.
 
-**Setting up a new phone:** install the app, open Cloud sync, enter the same
-three values. Your full history downloads on connect.
-
-### About the synced file
-
-Rounds are stored in a packed form — each round becomes a short array of
-numbers rather than a verbose object. A typical session is a few hundred bytes,
-so years of practice stay well under a megabyte, and every sync is a single
-small commit.
+Offline in the yard, nothing changes: rounds save to the phone as always and
+sync the next time you have signal.
 
 ## Your data
 

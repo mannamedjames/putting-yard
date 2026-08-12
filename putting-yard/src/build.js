@@ -39,6 +39,7 @@ const fs = require("fs");
 <link rel="stylesheet" media="print" onload="this.media='all'"
   href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@700;800&family=Barlow:wght@400;500;600&display=swap">
 <style>${css}</style>
+<script src="./config.js"></script>
 </head>
 <body>
 <div id="root"></div>

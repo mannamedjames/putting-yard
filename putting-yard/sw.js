@@ -3,10 +3,11 @@
 // deploy shows up on the very next launch, with the cache as the offline
 // fallback. Icons and fonts stay cache-first since they rarely change.
 
-const CACHE = "putting-yard-v5";
+const CACHE = "putting-yard-v6";
 const ASSETS = [
   "./",
   "./index.html",
+  "./config.js",
   "./manifest.webmanifest",
   "./icon-192.png",
   "./icon-512.png",
@@ -31,10 +32,11 @@ self.addEventListener("message", (e) => {
   if (e.data === "skip-waiting") self.skipWaiting();
 });
 
-const isPage = (req) =>
-  req.mode === "navigate" ||
-  req.destination === "document" ||
-  new URL(req.url).pathname.endsWith("index.html");
+const isPage = (req) => {
+  const p = new URL(req.url).pathname;
+  return req.mode === "navigate" || req.destination === "document" ||
+    p.endsWith("index.html") || p.endsWith("config.js");
+};
 
 self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
@@ -47,10 +49,10 @@ self.addEventListener("fetch", (e) => {
       fetch(e.request, { cache: "no-store" })
         .then((res) => {
           const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put("./index.html", copy));
+          caches.open(CACHE).then((c) => c.put(e.request, copy));
           return res;
         })
-        .catch(() => caches.match("./index.html").then((hit) => hit || caches.match("./")))
+        .catch(() => caches.match(e.request).then((hit) => hit || caches.match("./index.html")))
     );
     return;
   }
