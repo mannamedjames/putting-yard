@@ -61,34 +61,26 @@ climb one flag per round, a perfect run is 120 points. Finished runs are ranked
 on a leaderboard. Change the leaderboard name on the home screen before handing
 your phone to someone else and you'll both appear on the board.
 
-## Shared data across devices (set up once, then nothing)
+## Sharing data across devices
 
-Every device that opens the app can read and write one shared set of sessions
-and runs — no accounts, no tokens, nothing to enter on each phone. You set the
-address once, in `config.js`, and it ships with the app.
+Configured once on GitHub, never on a phone. Your history is a JSON file at a
+web address; `config.js` holds that address, and every device reads it from
+there.
 
-Getting a free database, about five minutes, one time:
+**Use jsonbin.io** — free and, unlike anonymous scratch services, it doesn't
+expire. Sign up (email, no card), create a bin containing `{ "app": "putting-yard" }` (jsonbin won't save an empty one), copy the Bin ID
+and your Master Key, and fill in the two lines in `config.js`:
 
-1. Go to console.firebase.google.com and click **Create a project**. Name it
-   anything; turn off Google Analytics when offered.
-2. In the sidebar: **Build → Realtime Database → Create Database**. Pick any
-   location. When it asks about security rules, choose **Start in test mode**.
-3. Copy the URL at the top of the Data tab. It looks like
-   `https://your-project-default-rtdb.firebaseio.com`
-4. Open `config.js` in your repo, paste the URL between the quotes on the
-   `window.PUTTING_DB` line, and commit.
+    window.PUTTING_DB = "https://api.jsonbin.io/v3/b/YOUR_BIN_ID";
+    window.PUTTING_HEADERS = { "X-Master-Key": "YOUR_MASTER_KEY" };
 
-That's it. Every device that loads the app now syncs to the same data — pulls
-when you open it, pushes when a session or run finishes, plus a **Sync now**
-button. The home screen shows "Shared data · on" when it's working.
+Commit, and every device that loads the site shares that bin. Settings will
+read "Shared data · from config.js" with a **Test connection** button that does
+a real read and write and reports what happened.
 
-Test mode expires after 30 days. When it does, go to the database's **Rules**
-tab and set both `.read` and `.write` to `true` to keep it open. That leaves the
-database readable by anyone who knows the URL, which is the trade for having no
-login at all — fine for putting stats, not for anything private.
-
-Offline in the yard, nothing changes: rounds save to the phone as always and
-sync the next time you have signal.
+Avoid jsonblob.com for anything you want to keep — its blobs expire. A Firebase
+Realtime Database URL also works in `PUTTING_DB` alone, and Settings can
+connect a GitHub repo per device if you'd rather.
 
 ## Your data
 

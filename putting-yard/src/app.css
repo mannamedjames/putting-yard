@@ -96,3 +96,11 @@ table { border-collapse: collapse; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* basket chains kick when a putt lands */
+@keyframes chains {
+  0%   { transform: rotate(0deg); }
+  30%  { transform: rotate(-7deg); }
+  60%  { transform: rotate(5deg); }
+  100% { transform: rotate(0deg); }
+}

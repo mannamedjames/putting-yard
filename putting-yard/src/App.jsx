@@ -24,7 +24,7 @@ const DISC = {
 const DEFAULT_ORDER = ["orange", "red", "green"];
 // Bump this every release. It's shown at the bottom of the home screen so you
 // can tell at a glance whether your phone picked up a new deploy.
-const BUILD = "v7 · tabs, flight, miss reporting";
+const BUILD = "v11.1 · durable store";
 const disp = { fontFamily: "'Barlow Condensed', sans-serif" };
 
 const body = { fontFamily: "'Barlow', sans-serif" };
@@ -430,6 +430,20 @@ const orderIndex = (o) => {
   return i < 0 ? 0 : i;
 };
 
+// Miss directions pack into one small number: 3 slots x 3 bits, in throw order.
+const DIR_CODE = { L: 1, R: 2, H: 3, Lo: 4 };
+const CODE_DIR = { 1: "L", 2: "R", 3: "H", 4: "Lo" };
+const packMiss = (order, miss = {}) =>
+  order.reduce((n, k, i) => n | ((DIR_CODE[miss[k]] || 0) << (i * 3)), 0);
+const unpackMiss = (order, code = 0) => {
+  const out = {};
+  order.forEach((k, i) => {
+    const d = CODE_DIR[(code >> (i * 3)) & 7];
+    if (d) out[k] = d;
+  });
+  return out;
+};
+
 function packSession(s) {
   return {
     s: s.startedAt,
@@ -437,7 +451,7 @@ function packSession(s) {
     r: s.rounds.map(r => {
       const o = roundOrder(r);
       const bits = o.reduce((n, k, i) => n | (r.results[k] ? 1 << i : 0), 0);
-      return [r.flag, bits, Math.round(r.dur || 0), orderIndex(o), r.prevWatch ? 1 : 0];
+      return [r.flag, bits, Math.round(r.dur || 0), orderIndex(o), r.prevWatch ? 1 : 0, packMiss(o, r.miss)];
     }),
   };
 }
@@ -445,25 +459,34 @@ function unpackSession(p) {
   return {
     startedAt: p.s,
     endedAt: p.e || undefined,
-    rounds: (p.r || []).map(([flag, bits, dur, oi, pw]) => {
+    rounds: (p.r || []).map(([flag, bits, dur, oi, pw, mcode]) => {
       const order = ORDERS[oi] || DEFAULT_ORDER;
       const results = {};
       order.forEach((k, i) => { results[k] = !!(bits & (1 << i)); });
       const made = order.reduce((n, k) => n + (results[k] ? 1 : 0), 0);
-      return { flag, results, made, order, dur, prevFlag: flag, prevWatch: !!pw };
+      return { flag, results, made, order, dur, prevFlag: flag, prevWatch: !!pw, miss: unpackMiss(order, mcode || 0) };
     }),
   };
 }
 function packGame(g) {
   const base = { s: g.startedAt, e: g.endedAt || null, c: gameScore(g), n: g.name || "Me" };
   return Array.isArray(g.rounds)
-    ? { ...base, r: g.rounds.map(x => [x.flag, x.made, x.prevWatch ? 1 : 0]) }   // ladder run
+    ? { ...base, r: g.rounds.map(x => [
+        x.flag, x.made, x.prevWatch ? 1 : 0,
+        (x.putts || []).reduce((n, v, i) => n | (v ? 1 << i : 0), 0),
+        [0, 1, 2].reduce((n, i) => n | ((DIR_CODE[(x.miss || {})[i]] || 0) << (i * 3)), 0),
+      ]) }   // ladder run
     : { ...base, h: (g.shots || []).map(x => [x.flag, x.made ? 1 : 0]) };        // legacy free-shot run
 }
 function unpackGame(p) {
   const base = { startedAt: p.s, endedAt: p.e || undefined, name: p.n || "Me" };
   if (p.r) {
-    const rounds = p.r.map(([flag, made, pw]) => ({ flag, made, prevFlag: flag, prevWatch: !!pw }));
+    const rounds = p.r.map(([flag, made, pw, pbits, mcode]) => {
+      const putts = pbits === undefined ? [] : [0, 1, 2].map(i => !!(pbits & (1 << i)));
+      const miss = {};
+      if (mcode) [0, 1, 2].forEach(i => { const d = CODE_DIR[(mcode >> (i * 3)) & 7]; if (d) miss[i] = d; });
+      return { flag, made, putts, miss, prevFlag: flag, prevWatch: !!pw };
+    });
     return { ...base, rounds, score: p.c ?? gameScore({ rounds }) };
   }
   const shots = (p.h || []).map(([flag, made]) => ({ flag, made: !!made }));
@@ -473,11 +496,19 @@ const packAll = (sessions, games, distances) => ({
   v: 1, t: Date.now(), d: distances,
   s: sessions.map(packSession), g: games.map(packGame),
 });
-const unpackAll = (p) => ({
-  sessions: (p.s || []).map(unpackSession),
-  games: (p.g || []).map(unpackGame),
-  distances: p.d || {},
+// Tolerant of whatever else is in the store: a starter value, a stray key, or
+// a partially written record shouldn't stop a sync.
+const safeMap = (arr, fn) => (Array.isArray(arr) ? arr : []).flatMap(x => {
+  try { const v = fn(x); return v ? [v] : []; } catch { return []; }
 });
+const unpackAll = (p) => {
+  const src = p && typeof p === "object" ? p : {};
+  return {
+    sessions: safeMap(src.s, unpackSession).filter(x => x.startedAt && Array.isArray(x.rounds)),
+    games: safeMap(src.g, unpackGame).filter(x => x.startedAt),
+    distances: src.d && typeof src.d === "object" ? src.d : {},
+  };
+};
 
 // merge two lists of records by start time; newer/longer wins on collisions
 function mergeRecords(a, b, sizeOf) {
@@ -489,32 +520,130 @@ function mergeRecords(a, b, sizeOf) {
   return [...by.values()].sort((x, y) => x.startedAt - y.startedAt);
 };
 
-// ---------- shared database ----------
-// Set once in config.js and baked into the deploy, so every device that opens
-// the app shares one data set with nothing to log into.
-const dbBase = () => {
-  const raw = (typeof window !== "undefined" && window.PUTTING_DB) || "";
-  return raw ? raw.replace(/\/+$/, "") : "";
-};
-const dbBucket = () => (typeof window !== "undefined" && window.PUTTING_BUCKET) || "yard";
-const dbConfigured = () => !!dbBase();
-const dbUrl = () => `${dbBase()}/${dbBucket()}.json`;
+// ---------- shared storage backends ----------
+// Three ways to share data across devices, in order of least setup:
+//   1. rest    — any URL that answers GET with JSON and accepts PUT of JSON
+//                (e.g. an anonymous JSON blob). No account, no token.
+//   2. firebase— a Realtime Database URL. Same shape, needs ".json" appended.
+//   3. github  — a repo file, using a token entered once on each device.
+//                Tokens can't live in config.js: GitHub revokes any token
+//                committed to a public repo.
+const cfgUrl = () => ((typeof window !== "undefined" && window.PUTTING_DB) || "").replace(/\/+$/, "");
+// A store URL can also be set in-app (kept on this device). config.js wins,
+// because that's the copy every device gets automatically.
+let localStoreUrl = "";
+const setLocalStore = (u) => { localStoreUrl = (u || "").replace(/\/+$/, ""); };
+const activeUrl = () => cfgUrl() || localStoreUrl;
 
-async function dbPull() {
-  const res = await fetch(`${dbUrl()}?t=${Date.now()}`, { cache: "no-store" });
-  if (res.status === 401 || res.status === 403) throw new Error("Database is locked — set its rules to allow reads and writes.");
-  if (!res.ok) throw new Error(`Database returned ${res.status}.`);
-  const j = await res.json();
-  return j || null;
+// Create an anonymous JSON blob — no account, no key. Returns its API URL.
+const JSONBLOB = "https://jsonblob.com/api/jsonBlob";
+async function createStore() {
+  const res = await fetch(JSONBLOB, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ v: 1, created: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`Couldn't create a store (${res.status}).`);
+  const loc = res.headers.get("Location") || res.headers.get("X-jsonblob");
+  if (!loc) throw new Error("Store created but its address wasn't readable — create one manually at jsonblob.com instead.");
+  return loc.startsWith("http") ? loc : `${JSONBLOB}/${loc}`;
+}
+const dbBucket = () => (typeof window !== "undefined" && window.PUTTING_BUCKET) || "yard";
+
+function backendKind(ghCfg) {
+  const u = activeUrl();
+  if (u) return u.includes("firebaseio.com") ? "firebase" : "rest";
+  if (ghCfg && ghCfg.owner && ghCfg.repo && ghCfg.token) return "github";
+  return null;
+}
+const dbConfiguredWith = (ghCfg) => !!backendKind(ghCfg);
+
+// Accept the address straight from the jsonblob browser bar and convert it to
+// the API form — copying the wrong one is the easiest mistake to make.
+function normalizeStoreUrl(raw) {
+  const u = (raw || "").trim().replace(/\/+$/, "");
+  const jb = u.match(/^https?:\/\/(?:www\.)?jsonblob\.com\/(?!api\/)([\w-]+)$/i);
+  return jb ? `https://jsonblob.com/api/jsonBlob/${jb[1]}` : u;
 }
 
-async function dbPush(payload) {
-  const res = await fetch(dbUrl(), {
+const restUrl = () => {
+  const u = activeUrl();
+  if (u.includes("firebaseio.com")) return `${u}/${dbBucket()}.json`;
+  return normalizeStoreUrl(u);
+};
+
+const GH_PATH = "putting-data.json";
+const ghHeaders = (cfg) => ({
+  Authorization: `Bearer ${cfg.token}`,
+  Accept: "application/vnd.github+json",
+  "X-GitHub-Api-Version": "2022-11-28",
+});
+const b64encode = (str) => btoa(unescape(encodeURIComponent(str)));
+const b64decode = (str) => decodeURIComponent(escape(atob(str.replace(/\s/g, ""))));
+
+async function ghPull(cfg) {
+  const res = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}?t=${Date.now()}`,
+    { headers: ghHeaders(cfg), cache: "no-store" });
+  if (res.status === 404) return { data: null, sha: null };
+  if (res.status === 401) throw new Error("Token rejected — check it was pasted in full.");
+  if (res.status === 403) throw new Error("Token lacks Contents write access to that repo.");
+  if (!res.ok) throw new Error(`GitHub returned ${res.status}.`);
+  const j = await res.json();
+  return { data: JSON.parse(b64decode(j.content)), sha: j.sha };
+}
+
+async function ghPush(cfg, payload, sha) {
+  const res = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${GH_PATH}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...ghHeaders(cfg), "Content-Type": "application/json" },
+    body: JSON.stringify({
+      message: `putting yard ${new Date().toISOString().slice(0, 16).replace("T", " ")}`,
+      content: b64encode(JSON.stringify(payload)),
+      ...(sha ? { sha } : {}),
+    }),
+  });
+  if (res.status === 409) throw new Error("Someone else synced first — try Sync now again.");
+  if (!res.ok) throw new Error(`Save failed (${res.status}).`);
+  const j = await res.json();
+  return j.content?.sha || null;
+}
+
+// Extra headers from config.js, for stores that want an API key.
+const cfgHeaders = () => (typeof window !== "undefined" && window.PUTTING_HEADERS) || {};
+
+// jsonbin reads from /latest and wraps the payload in { record: ... };
+// everything else is a plain GET/PUT of the JSON itself.
+const isJsonbin = (u) => /api\.jsonbin\.io\/v3\/b\//i.test(u);
+
+async function restPull() {
+  const base = restUrl();
+  const url = isJsonbin(base) ? `${base.replace(/\/latest$/, "")}/latest` : base;
+  const res = await fetch(url.includes("?") ? `${url}&t=${Date.now()}` : `${url}?t=${Date.now()}`, {
+    cache: "no-store",
+    headers: { Accept: "application/json", ...cfgHeaders() },
+  });
+  if (res.status === 404) return null;
+  if (res.status === 401 || res.status === 403) throw new Error("Store rejected the request — check the key in config.js.");
+  if (!res.ok) throw new Error(`Store returned ${res.status}.`);
+  const j = await res.json();
+  if (!j) return null;
+  return isJsonbin(base) && j.record !== undefined ? j.record : j;
+}
+
+async function restPush(payload) {
+  const base = restUrl();
+  const url = isJsonbin(base) ? base.replace(/\/latest$/, "") : base;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(isJsonbin(base) ? { "X-Bin-Versioning": "false" } : {}),
+      ...cfgHeaders(),
+    },
     body: JSON.stringify(payload),
   });
-  if (res.status === 401 || res.status === 403) throw new Error("Database is locked — set its rules to allow reads and writes.");
+  if (res.status === 401 || res.status === 403) throw new Error("Store rejected the write — check the key in config.js.");
   if (!res.ok) throw new Error(`Save failed (${res.status}).`);
   return true;
 }
@@ -641,90 +770,147 @@ function PuttRow({ label, sub, tint, value, dir, onMade, onMiss, onHoist, canHoi
 }
 
 // ---------- flight path ----------
-// The ladder drawn as a disc flight: a hyzer arc from the tee up to the basket,
-// with the five flags spaced along it and the disc parked on your current one.
-// The ladder as a fairway: basket at the near end, flags marching away from it,
-// and — the good part — when a round lands, the three putts actually fly. Makes
-// arc into the chains, misses veer off in the direction you logged them.
-function FlightPath({ flag, watch, highest = 1, throwFx = null }) {
-  const W = 320, H = 118;
-  const p0 = { x: 62, y: H - 34 }, p1 = { x: 205, y: H - 30 }, p2 = { x: W - 22, y: 22 };
+// The ladder drawn as a fairway you're working down: basket and chains at the
+// near end, flags marching out to distance. When a round lands, the three putts
+// fly for real — animated frame by frame, not with SMIL, whose begin times are
+// measured from page load and so never fire on an element added later.
+function useFlight(throwFx, onDone) {
+  const [frame, setFrame] = useState(null);
+  const raf = useRef(0);
+  useEffect(() => {
+    if (!throwFx) { setFrame(null); return; }
+    const DELAY = 150, FLY = 560, HOLD = 420;
+    const n = throwFx.results.length;
+    const total = DELAY * (n - 1) + FLY + HOLD;
+    const t0 = performance.now();
+    const tick = (now) => {
+      const e = now - t0;
+      setFrame(throwFx.results.map((_, i) => {
+        const local = e - i * DELAY;
+        if (local <= 0) return { t: 0, live: false };
+        if (local >= FLY) return { t: 1, live: true, landed: true };
+        const t = local / FLY;
+        return { t: 1 - Math.pow(1 - t, 1.7), live: true }; // ease-out, like a disc losing speed
+      }));
+      if (e < total) raf.current = requestAnimationFrame(tick);
+      else { setFrame(null); onDone && onDone(); }
+    };
+    raf.current = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf.current);
+  }, [throwFx && throwFx.id]);
+  return frame;
+}
+
+function FlightPath({ flag, watch, highest = 1, throwFx = null, colors = null, onFlightDone, distances = {} }) {
+  const W = 320, H = 150;
+  const frame = useFlight(throwFx, onFlightDone);
+
+  // the fairway line: flags recede up and to the right
+  const p0 = { x: 108, y: H - 44 }, p1 = { x: 222, y: H - 40 }, p2 = { x: W - 22, y: 32 };
   const at = (t) => ({
     x: (1 - t) ** 2 * p0.x + 2 * (1 - t) * t * p1.x + t ** 2 * p2.x,
     y: (1 - t) ** 2 * p0.y + 2 * (1 - t) * t * p1.y + t ** 2 * p2.y,
   });
   const stops = [1, 2, 3, 4, 5].map(f => ({ f, ...at((f - 1) / 4) }));
-  const disc = stops[flag - 1];
+  const here = stops[flag - 1];
   const accent = watch ? C.amber : C.fairway;
-  const path = `M${p0.x} ${p0.y} Q${p1.x} ${p1.y} ${p2.x} ${p2.y}`;
-  const basket = { x: 22, y: p0.y - 16 };
+  const line = `M${p0.x} ${p0.y} Q${p1.x} ${p1.y} ${p2.x} ${p2.y}`;
+  const basket = { x: 22, y: H - 78 };
+  const target = { x: basket.x + 9, y: basket.y + 30 };
 
-  // flight paths for the putts of the round that just landed
-  const shots = throwFx ? throwFx.results : [];
+  // a putt's arc, from the flag you threw from to the chains
   const from = throwFx ? stops[throwFx.flag - 1] : null;
-  const made = shots.filter(Boolean).length;
-
-  const flightPath = (hit, dir, i) => {
-    if (!from) return "";
-    const lift = 26 + i * 5;                       // each putt takes a slightly different line
-    const cx = (from.x + basket.x) / 2, cy = Math.min(from.y, basket.y) - lift;
-    if (hit) return `M${from.x} ${from.y - 12} Q${cx} ${cy} ${basket.x + 2} ${basket.y + 4}`;
-    const off = { L: [-16, 8], R: [16, 6], H: [2, -18], Lo: [0, 22] }[dir] || [10, 14];
-    return `M${from.x} ${from.y - 12} Q${cx} ${cy} ${basket.x + 2 + off[0]} ${basket.y + 4 + off[1]}`;
+  const arcPoint = (i, t, hit, dir) => {
+    const start = { x: from.x, y: from.y - 14 };
+    const off = hit ? { x: 0, y: 0 } : ({ L: { x: -20, y: 4 }, R: { x: 20, y: 2 }, H: { x: -2, y: -22 }, Lo: { x: -2, y: 20 } }[dir] || { x: 14, y: 10 });
+    const end = { x: target.x + off.x, y: target.y + off.y };
+    const lift = 30 + i * 7;
+    const cx = (start.x + end.x) / 2, cy = Math.min(start.y, end.y) - lift;
+    return {
+      x: (1 - t) ** 2 * start.x + 2 * (1 - t) * t * cx + t ** 2 * end.x,
+      y: (1 - t) ** 2 * start.y + 2 * (1 - t) * t * cy + t ** 2 * end.y,
+    };
   };
+
+  const anyLanded = frame && throwFx && frame.some((f, i) => f.landed && throwFx.results[i]);
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: "block", overflow: "visible" }} aria-hidden="true">
-      {/* basket: pole, chains, band, base */}
-      <g stroke={throwFx && made ? accent : C.line} strokeWidth="1.7" fill="none" strokeLinecap="round"
-        style={{ transition: "stroke 400ms" }} transform={`translate(${basket.x} ${basket.y})`}>
-        <path d="M9 -6v26" />
-        <path d="M2 0h14" />
-        <path d="M4 0l5 6 5-6" />
-        <path d="M4.5 0l1.5 6M13.5 0l-1.5 6" />
-        <path d="M3 9h12l-1.5 5h-9z" fill={throwFx && made ? `${C.fairway}22` : "transparent"} />
-        <path d="M5 20h8" />
-      </g>
+      <defs>
+        <linearGradient id="fairway" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0%" stopColor={accent} stopOpacity="0.95" />
+          <stop offset="100%" stopColor={accent} stopOpacity="0.45" />
+        </linearGradient>
+      </defs>
 
-      {/* the run ahead */}
-      <path d={path} fill="none" stroke={C.line} strokeWidth="2" strokeDasharray="2.5 5" strokeLinecap="round" />
-      {/* ground covered */}
-      <path d={path} fill="none" stroke={accent} strokeWidth="2.5" strokeLinecap="round"
+      {/* ground line, so the flags feel planted */}
+      <path d={line} fill="none" stroke={C.line} strokeWidth="12" strokeLinecap="round" opacity="0.35" />
+
+      {/* distance still to earn */}
+      <path d={line} fill="none" stroke={C.line} strokeWidth="2.5" strokeDasharray="2 6" strokeLinecap="round" />
+      {/* distance already earned */}
+      <path d={line} fill="none" stroke="url(#fairway)" strokeWidth="3" strokeLinecap="round"
         pathLength="100" strokeDasharray="100"
         strokeDashoffset={100 - ((flag - 1) / 4) * 100}
-        style={{ transition: "stroke-dashoffset 520ms cubic-bezier(.22,.9,.3,1), stroke 300ms" }} />
+        style={{ transition: "stroke-dashoffset 560ms cubic-bezier(.22,.9,.3,1)" }} />
 
+      {/* basket: pole, chains, band, tray */}
+      <g transform={`translate(${basket.x} ${basket.y})`} fill="none" strokeLinecap="round"
+        stroke={anyLanded ? accent : C.faint} strokeWidth="1.8" style={{ transition: "stroke 220ms" }}>
+        <path d="M9 2v34" />
+        <path d="M0 10h18" />
+        <g style={{ transformOrigin: "9px 10px", animation: anyLanded ? "chains 420ms ease-out" : "none" }}>
+          <path d="M2.5 10l6.5 8 6.5-8" />
+          <path d="M5.5 10l3.5 8M12.5 10l-3.5 8" />
+        </g>
+        <path d="M1.5 20h15l-2 6h-11z" fill={anyLanded ? `${C.fairway}1f` : "transparent"} style={{ transition: "fill 220ms" }} />
+        <path d="M4 36h10" />
+      </g>
+
+      {/* flags */}
       {stops.map(s => {
         const reached = highest >= s.f, cur = s.f === flag;
         return (
           <g key={s.f} transform={`translate(${s.x} ${s.y})`}>
-            <line x1="0" y1="1" x2="0" y2="13" stroke={cur ? C.ink : reached ? "#B9C6BC" : C.line} strokeWidth="1.7" strokeLinecap="round" />
-            <path d="M0.5 1.5 L10 4.8 L0.5 8 Z"
+            <ellipse cx="0" cy="1" rx={cur ? 7 : 5} ry="2" fill={C.line} opacity="0.7" />
+            <line x1="0" y1="0" x2="0" y2={cur ? -20 : -15} stroke={cur ? C.ink : reached ? "#A9BBAE" : C.line} strokeWidth={cur ? 2 : 1.6} strokeLinecap="round" />
+            <path d={cur ? "M0.6 -19 L13 -14.5 L0.6 -10 Z" : "M0.5 -14.5 L9.5 -11 L0.5 -7.5 Z"}
               fill={cur ? accent : reached ? "#CFE3D6" : "#ECE9DF"}
               stroke={cur ? C.ink : C.line} strokeWidth="0.9" strokeLinejoin="round" />
-            <text x="0" y="23" textAnchor="middle"
-              style={{ ...disp, fontWeight: 700, fontSize: 12, fill: cur ? C.ink : C.faint }}>{s.f}</text>
+            <text x="0" y="14" textAnchor="middle"
+              style={{ ...disp, fontWeight: cur ? 800 : 700, fontSize: cur ? 13 : 11, fill: cur ? C.ink : C.faint }}>{s.f}</text>
+            {distances[s.f] && (
+              <text x="0" y="24" textAnchor="middle" style={{ fontSize: 8, fill: C.line }}>{distances[s.f]}ft</text>
+            )}
           </g>
         );
       })}
 
-      {/* discs in flight — one per putt of the round just logged */}
-      {throwFx && shots.map((hit, i) => (
-        <g key={`${throwFx.id}-${i}`} opacity="0">
-          <ellipse rx="6.5" ry="2.8" fill={hit ? C.fairway : C.miss} stroke={C.ink} strokeWidth="0.9" />
-          <animateMotion path={flightPath(hit, throwFx.dirs[i], i)} dur="0.62s"
-            begin={`${i * 0.16}s`} fill="freeze" rotate="auto" />
-          <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.08;0.82;1"
-            dur="0.85s" begin={`${i * 0.16}s`} fill="freeze" />
-        </g>
-      ))}
-
-      {/* your disc, parked on the flag you're on */}
-      <g style={{ transition: "transform 520ms cubic-bezier(.22,.9,.3,1)" }}
-        transform={`translate(${disc.x} ${disc.y - 13})`}>
-        <ellipse rx="9.5" ry="4" fill={accent} stroke={C.ink} strokeWidth="1.1" />
-        <ellipse rx="4.2" ry="1.5" fill="none" stroke={C.paper} strokeWidth="1" opacity="0.85" />
+      {/* where you stand now */}
+      <g transform={`translate(${here.x} ${here.y - 30})`} style={{ transition: "transform 560ms cubic-bezier(.22,.9,.3,1)" }}>
+        <ellipse rx="10" ry="4.2" fill={accent} stroke={C.ink} strokeWidth="1.2" />
+        <ellipse rx="4.4" ry="1.6" fill="none" stroke={C.paper} strokeWidth="1" opacity="0.85" />
       </g>
+
+      {/* the round in flight */}
+      {frame && throwFx && frame.map((f, i) => {
+        if (!f.live) return null;
+        const hit = throwFx.results[i];
+        const dir = throwFx.dirs[i];
+        const pt = arcPoint(i, f.t, hit, dir);
+        const prev = arcPoint(i, Math.max(0, f.t - 0.06), hit, dir);
+        const ang = (Math.atan2(pt.y - prev.y, pt.x - prev.x) * 180) / Math.PI;
+        const fade = f.landed ? 0.35 : 1;
+        const col = hit ? (colors && colors[i]) || C.fairway : C.miss;
+        return (
+          <g key={i} opacity={fade} style={{ transition: f.landed ? "opacity 320ms" : "none" }}>
+            <line x1={prev.x} y1={prev.y} x2={pt.x} y2={pt.y} stroke={col} strokeWidth="1.4" opacity="0.35" strokeLinecap="round" />
+            <g transform={`translate(${pt.x} ${pt.y}) rotate(${ang * 0.35})`}>
+              <ellipse rx="7" ry="2.9" fill={col} stroke={C.ink} strokeWidth="0.9" />
+            </g>
+          </g>
+        );
+      })}
     </svg>
   );
 }
@@ -1272,6 +1458,10 @@ export default function App() {
       const ga = await loadKey("dg-game-active");
       const pn = await loadKey("dg-player");
       if (pn) setPlayerName(pn);
+      const storeU = await loadKey("dg-store");
+      if (storeU) { setLocalStore(storeU); setStoreUrl(storeU); }
+      const ghCfg = await loadKey("dg-gh");
+      if (ghCfg) { setGh(ghCfg); ghRef.current = ghCfg; }
       const ls = await loadKey("dg-lastsync");
       if (ls) setLastSync(ls);
       // ask the browser not to evict our data
@@ -1312,6 +1502,66 @@ export default function App() {
 
   const ft = f => (distances[f] ? `${distances[f]} ft` : null);
 
+  const useStore = (url) => {
+    const clean = (url || "").trim().replace(/\/+$/, "");
+    if (!clean) { setSyncMsg("Paste a store URL first."); return; }
+    const norm = normalizeStoreUrl(clean);
+    setLocalStore(norm); setStoreUrl(norm); saveKey("dg-store", norm);
+    setStoreForm("");
+    setTimeout(() => syncNow(false), 200);
+  };
+
+  const makeStore = async () => {
+    setCreating(true); setSyncMsg("Creating a store…");
+    try {
+      const url = await createStore();
+      setLocalStore(url); setStoreUrl(url); saveKey("dg-store", url);
+      setSyncMsg("Store created.");
+      setTimeout(() => syncNow(true), 300);
+    } catch (e) {
+      setSyncMsg(e.message || "Couldn't create a store.");
+    }
+    setCreating(false);
+  };
+
+  const forgetStore = () => {
+    setLocalStore(""); setStoreUrl(""); deleteKey("dg-store");
+    setSyncMsg("Store disconnected on this device.");
+    setTimeout(() => setSyncMsg(""), 4000);
+  };
+
+  const connectGh = async () => {
+    const cfg = { owner: ghForm.owner.trim(), repo: ghForm.repo.trim(), token: ghForm.token.trim() };
+    if (!cfg.owner || !cfg.repo || !cfg.token) { setSyncMsg("Fill in all three fields."); return; }
+    setGh(cfg); ghRef.current = cfg; saveKey("dg-gh", cfg);
+    setShowGh(false);
+    setTimeout(() => syncNow(false), 200);
+  };
+
+  const disconnectGh = () => {
+    setGh(null); ghRef.current = null; deleteKey("dg-gh");
+    setGhForm({ owner: "", repo: "", token: "" });
+    setSyncMsg("Disconnected. Data stays on this device.");
+    setTimeout(() => setSyncMsg(""), 4000);
+  };
+
+  // Read/write probe against the configured store, reported in plain words.
+  const testStore = async () => {
+    setSyncing(true); setSyncMsg("Testing…");
+    try {
+      const before = await restPull();
+      await restPush({ ...(before || {}), probe: Date.now() });
+      const after = await restPull();
+      if (!after || !after.probe) throw new Error("Wrote, but the value didn't come back. The store may be read-only.");
+      await syncNow(true);
+      setSyncMsg("Working — read and wrote successfully.");
+    } catch (e) {
+      setSyncMsg(e.message || "Couldn't reach the store.");
+    }
+    setSyncing(false);
+    setTimeout(() => setSyncMsg(""), 8000);
+  };
+
   const setDistance = (f, val) => {
     const n = parseInt(val, 10);
     const next = { ...distances, [f]: Number.isFinite(n) && n > 0 ? n : null };
@@ -1320,6 +1570,15 @@ export default function App() {
   };
 
   const fileRef = useRef(null);
+  const [storeUrl, setStoreUrl] = useState("");
+  const [storeForm, setStoreForm] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [gh, setGh] = useState(null);           // {owner, repo, token} — this device only
+  const [ghForm, setGhForm] = useState({ owner: "", repo: "", token: "" });
+  const [showGh, setShowGh] = useState(false);
+  const ghRef = useRef(null);
+  ghRef.current = gh;
+
   // always-current snapshot of local data for async callbacks
   const dataRef = useRef({ sessions: [], games: [], distances: {} });
   dataRef.current = { sessions, games, distances };
@@ -1332,11 +1591,14 @@ export default function App() {
   // Local values come from a ref, never the closure: a sync fired moments after
   // saving a session would otherwise merge against the pre-save list and lose it.
   const syncNow = async (quiet = false) => {
-    if (!dbConfigured() || syncing) return;
+    const kind = backendKind(ghRef.current);
+    if (!kind || syncing) return;
     setSyncing(true);
     if (!quiet) setSyncMsg("Syncing…");
     try {
-      const data = await dbPull();
+      let data = null, sha = null;
+      if (kind === "github") { const r = await ghPull(ghRef.current); data = r.data; sha = r.sha; }
+      else data = await restPull();
       const local = dataRef.current;
       let ns = local.sessions, ngm = local.games, nd = local.distances;
       if (data) {
@@ -1347,7 +1609,8 @@ export default function App() {
         setSessions(ns); setGames(ngm); setDistances(nd);
         saveKey("dg-sessions", ns); saveKey("dg-games", ngm); saveKey("dg-flags", nd);
       }
-      await dbPush(packAll(ns, ngm, nd));
+      if (kind === "github") await ghPush(ghRef.current, packAll(ns, ngm, nd), sha);
+      else await restPush(packAll(ns, ngm, nd));
       const now = Date.now();
       setLastSync(now); saveKey("dg-lastsync", now);
       setSyncMsg(`Synced — ${ns.length} sessions, ${ngm.length} runs.`);
@@ -1401,10 +1664,10 @@ export default function App() {
   // browser picks the history back up on its own
   const pulledOnce = useRef(false);
   useEffect(() => {
-    if (!loaded || !dbConfigured() || pulledOnce.current) return;
+    if (!loaded || !dbConfiguredWith(ghRef.current) || pulledOnce.current) return;
     pulledOnce.current = true;
     syncNow(true);
-  }, [loaded]);
+  }, [loaded, gh]);
 
   // last-chance save if the app is backgrounded or closed mid-round
   const liveRef = useRef({ active: null, pending: null, game: null });
@@ -1508,11 +1771,10 @@ export default function App() {
         buzz(pattern);
         const order = roundOrder(prev);
         setThrowFx({
-          id: now, flag: prev.flag,
+          id: now, flag: prev.flag, order: [...order],
           results: order.map(k => !!p[k]),
           dirs: order.map(k => dirs[k] || null),
         });
-        setTimeout(() => setThrowFx(f => (f && f.id === now ? null : f)), 1400);
       });
       return next;
     });
@@ -1539,7 +1801,7 @@ export default function App() {
     const list = [...sessions, done];
     setSessions(list); setActive(null); setDetailIdx(list.length - 1);
     saveKey("dg-sessions", list); deleteKey("dg-active");
-    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
+    if (dbConfiguredWith(ghRef.current)) setTimeout(() => syncNow(true), 400);
     setConfirmDelete(false);
     setView("detail");
   };
@@ -1570,7 +1832,7 @@ export default function App() {
     const list = [...games, done];
     setGames(list); setGame(null); setGameIdx(list.length - 1);
     saveKey("dg-games", list); deleteKey("dg-game-active");
-    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
+    if (dbConfiguredWith(ghRef.current)) setTimeout(() => syncNow(true), 400);
     setConfirmDelete(false);
     setView("gamedetail");
   };
@@ -1601,7 +1863,6 @@ export default function App() {
         setBanner(`${made}/3 at flag ${prev.flag} — +${pts} pts · ${msg.replace(/^\d\/3 — /, "")}`);
         const fxId = Date.now();
         setThrowFx({ id: fxId, flag: prev.flag, results: p.map(v => !!v), dirs: [0, 1, 2].map(i => dirs[i] || null) });
-        setTimeout(() => setThrowFx(f => (f && f.id === fxId ? null : f)), 1400);
         buzz(nf > prev.flag ? [40, 60, 40, 60, 80] : nf < prev.flag ? [180] : made >= 2 ? [30] : [60, 50, 60]);
         if (next.rounds.length >= GAME_ROUNDS) finishGame(next);
         else saveKey("dg-game-active", next);
@@ -1639,7 +1900,7 @@ export default function App() {
   const writeSessions = (list) => {
     setSessions(list);
     saveKey("dg-sessions", list);
-    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
+    if (dbConfiguredWith(ghRef.current)) setTimeout(() => syncNow(true), 400);
   };
 
   const togglePutt = (sIdx, rIdx, disc) => {
@@ -1722,7 +1983,11 @@ export default function App() {
         </div>
 
         {/* flag rail + current flag */}
-        <FlightPath flag={active.flag} watch={active.watch} highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)} throwFx={throwFx} />
+        <FlightPath flag={active.flag} watch={active.watch}
+          highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)}
+          throwFx={throwFx} distances={distances}
+          colors={(throwFx?.order || order).map(k => DISC[k].color)}
+          onFlightDone={() => setThrowFx(null)} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 38, lineHeight: 1 }}>FLAG {active.flag}</span>
           {ft(active.flag) && <span style={{ ...disp, fontWeight: 700, fontSize: 20, color: C.faint }} className="ml-2">{ft(active.flag)}</span>}
@@ -1787,7 +2052,10 @@ export default function App() {
         </div>
 
         {/* flag rail */}
-        <FlightPath flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} throwFx={throwFx} />
+        <FlightPath flag={game.flag} watch={game.watch}
+          highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)}
+          throwFx={throwFx} distances={distances}
+          onFlightDone={() => setThrowFx(null)} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 34, lineHeight: 1 }}>FLAG {game.flag}</span>
           <span style={{ ...disp, fontWeight: 700, fontSize: 19, color: C.fairway }} className="ml-2">
@@ -2174,35 +2442,125 @@ export default function App() {
         </div>
         <div style={{ fontSize: 12, color: C.faint }} className="mt-2">Set once — distances show on the session screen and in your flag stats.</div>
       </div>
-      <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
-        <div className="flex items-center justify-between mb-2">
-          <div className="flex items-center gap-1.5" style={{ color: C.faint }}>
-            <Icon name="cloud" size={14} />
-            <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              Shared data {dbConfigured() ? "· on" : "· off"}
-            </span>
-          </div>
-          {dbConfigured() && (
-            <button onClick={() => syncNow(false)} disabled={syncing} className="rounded-full px-3 py-1"
-              style={{ border: `1.5px solid ${C.line}`, color: syncing ? C.line : C.ink, fontSize: 13, fontWeight: 600 }}>
-              {syncing ? "Syncing…" : "Sync now"}
-            </button>
-          )}
-        </div>
+      {(() => {
+        const kind = backendKind(gh);
+        const fromConfig = !!cfgUrl();
+        const label = fromConfig ? "· from config.js"
+          : kind === "github" ? "· this device"
+          : kind === "rest" ? "· this device"
+          : "· off";
+        return (
+          <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-1.5" style={{ color: C.faint }}>
+                <Icon name="cloud" size={14} />
+                <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                  Shared data {label}
+                </span>
+              </div>
+              {kind && (
+                <button onClick={() => syncNow(false)} disabled={syncing} className="rounded-full px-3 py-1"
+                  style={{ border: `1.5px solid ${C.line}`, color: syncing ? C.line : C.ink, fontSize: 13, fontWeight: 600 }}>
+                  {syncing ? "Syncing…" : "Sync now"}
+                </button>
+              )}
+            </div>
 
-        {dbConfigured() ? (
-          <div style={{ fontSize: 12, color: syncMsg && !syncMsg.startsWith("Synced") && !syncMsg.startsWith("Syncing") ? C.amber : C.faint, lineHeight: 1.5 }}>
-            {syncMsg || (lastSync
-              ? `Last synced ${fmtDate(lastSync)}. Every device using this app reads and writes the same data — nothing to log into.`
-              : "Connected. Syncing when a session or run finishes.")}
+            {kind ? (
+              <>
+                <div style={{ fontSize: 12, color: syncMsg && !/^Sync/.test(syncMsg) ? C.amber : C.faint, lineHeight: 1.5 }}>
+                  {syncMsg || (lastSync
+                    ? `Last synced ${fmtDate(lastSync)}. ${kind === "github" ? "Saving to " + gh.owner + "/" + gh.repo + "." : "Every device that loads this site shares this data."}`
+                    : "Connected. Syncs when a session or run finishes.")}
+                </div>
+
+                {fromConfig && (
+                  <div className="rounded-xl px-3 py-2 mt-2" style={{ background: "#FAF8F2", border: `1px dashed ${C.line}` }}>
+                    <div style={{ fontSize: 11, color: C.faint }}>
+                      Address set in config.js — nothing to configure on any phone. Open this in a browser to see your raw data:
+                    </div>
+                    <div style={{ fontSize: 11, wordBreak: "break-all" }} className="mt-1">{cfgUrl()}</div>
+                    <button onClick={testStore} disabled={syncing}
+                      className="rounded-lg px-3 py-1 mt-2" style={{ border: `1.5px solid ${C.line}`, fontSize: 12, fontWeight: 600 }}>
+                      {syncing ? "Testing…" : "Test connection"}
+                    </button>
+                  </div>
+                )}
+                {kind === "rest" && !cfgUrl() && (
+                  <>
+                    <div className="rounded-xl px-3 py-2 mt-2" style={{ background: "#FAF8F2", border: `1px dashed ${C.line}` }}>
+                      <div style={{ fontSize: 11, color: C.faint }}>Store address — put this in config.js so every device joins automatically:</div>
+                      <div style={{ fontSize: 11, wordBreak: "break-all" }} className="mt-1">{storeUrl}</div>
+                      <button onClick={() => { navigator.clipboard?.writeText(storeUrl); setSyncMsg("Address copied."); setTimeout(() => setSyncMsg(""), 3000); }}
+                        className="rounded-lg px-3 py-1 mt-2" style={{ border: `1.5px solid ${C.line}`, fontSize: 12, fontWeight: 600 }}>
+                        Copy address
+                      </button>
+                    </div>
+                    <button onClick={forgetStore} className="w-full rounded-xl py-2 mt-2"
+                      style={{ border: `1.5px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 15 }}>
+                      Disconnect this device
+                    </button>
+                  </>
+                )}
+                {kind === "github" && (
+                  <button onClick={disconnectGh} className="w-full rounded-xl py-2 mt-3"
+                    style={{ border: `1.5px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 15 }}>
+                    Disconnect this device
+                  </button>
+                )}
+              </>
+            ) : !showGh ? (
+              <>
+                <div style={{ fontSize: 13, color: C.faint, lineHeight: 1.5 }}>
+                  Off — history lives on this device only. Create a shared store and every device that has its
+                  address keeps the same history, with no accounts anywhere.
+                </div>
+                <button onClick={makeStore} disabled={creating} className="w-full rounded-xl py-3 mt-3"
+                  style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 17 }}>
+                  {creating ? "Creating…" : "Create a shared store"}
+                </button>
+                <div className="flex gap-2 mt-2">
+                  <input value={storeForm} onChange={e => setStoreForm(e.target.value)}
+                    placeholder="…or paste an existing store URL" autoCapitalize="none" autoCorrect="off"
+                    className="flex-1 rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 14 }} />
+                  <button onClick={() => useStore(storeForm)} className="rounded-xl px-4"
+                    style={{ border: `2px solid ${C.line}`, ...disp, fontWeight: 700, fontSize: 15 }}>Join</button>
+                </div>
+                {syncMsg && <div style={{ fontSize: 12, color: C.amber }} className="mt-2">{syncMsg}</div>}
+                <button onClick={() => setShowGh(true)} className="w-full rounded-xl py-2 mt-2"
+                  style={{ color: C.faint, ...disp, fontWeight: 700, fontSize: 14 }}>
+                  Or use GitHub instead
+                </button>
+              </>
+            ) : (
+              <>
+                <div className="flex flex-col gap-2">
+                  <input value={ghForm.owner} onChange={e => setGhForm({ ...ghForm, owner: e.target.value })}
+                    placeholder="GitHub username" autoCapitalize="none" autoCorrect="off"
+                    className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+                  <input value={ghForm.repo} onChange={e => setGhForm({ ...ghForm, repo: e.target.value })}
+                    placeholder="Repo name (e.g. putting-data)" autoCapitalize="none" autoCorrect="off"
+                    className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+                  <input value={ghForm.token} onChange={e => setGhForm({ ...ghForm, token: e.target.value })}
+                    placeholder="Token (github_pat_…)" type="password" autoCapitalize="none" autoCorrect="off"
+                    className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+                </div>
+                <button onClick={connectGh} disabled={syncing} className="w-full rounded-xl py-3 mt-2"
+                  style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 700, fontSize: 17 }}>
+                  {syncing ? "Connecting…" : "Connect and sync"}
+                </button>
+                {syncMsg && <div style={{ fontSize: 12, color: C.amber }} className="mt-2">{syncMsg}</div>}
+                <div style={{ fontSize: 12, color: C.faint, lineHeight: 1.5 }} className="mt-2">
+                  Entered once on this device and remembered. The token stays here — it is never written into the repo.
+                </div>
+                <button onClick={() => setShowGh(false)} className="w-full rounded-xl py-2 mt-2"
+                  style={{ color: C.faint, ...disp, fontWeight: 700, fontSize: 14 }}>Cancel</button>
+              </>
+            )}
           </div>
-        ) : (
-          <div style={{ fontSize: 13, color: C.faint, lineHeight: 1.5 }}>
-            Not set up. Put your database URL in <strong>config.js</strong> and redeploy, and every device will share one set of
-            sessions and runs automatically — no accounts, no tokens. Setup notes are in that file.
-          </div>
-        )}
-      </div>
+        );
+      })()}
+
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
         <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
           <Icon name="save" size={14} />
@@ -2221,7 +2579,7 @@ export default function App() {
         <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
           onChange={e => { const f = e.target.files?.[0]; if (f) importData(f); e.target.value = ""; }} />
         <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
-          {backupMsg || (dbConfigured()
+          {backupMsg || (backendKind(gh)
             ? "Synced to your shared database. A backup file is still worth keeping now and then."
             : "Your data lives on this device only. Save a backup file now and then, or to move to a new phone.")}
         </div>
@@ -2234,3 +2592,11 @@ export default function App() {
     </>
   );
 }
+
+// Exported for the test harness; unused by the app itself.
+export {
+  applyRules, replaySession, computeStats, missAnalysis, currentStreak,
+  packSession, unpackSession, packGame, unpackGame, packAll, unpackAll,
+  gameScore, gameMakes, gameFlagTable, leaderboard, ceilingAnalysis,
+  pressureSplit, timeOfDay, fatigueCurve, paceEffect, mergeRecords,
+};
