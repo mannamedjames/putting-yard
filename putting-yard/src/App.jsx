@@ -24,7 +24,7 @@ const DISC = {
 const DEFAULT_ORDER = ["orange", "red", "green"];
 // Bump this every release. It's shown at the bottom of the home screen so you
 // can tell at a glance whether your phone picked up a new deploy.
-const BUILD = "v6 · flight path, miss zones, shared data";
+const BUILD = "v7 · tabs, flight, miss reporting";
 const disp = { fontFamily: "'Barlow Condensed', sans-serif" };
 
 const body = { fontFamily: "'Barlow', sans-serif" };
@@ -259,6 +259,108 @@ function trendData(sessions) {
   return out;
 }
 
+// ---------- deeper analytics ----------
+// Rounds logged before miss direction existed are counted as "Prior" rather
+// than dropped, so old sessions still contribute to totals honestly.
+function missAnalysis(rounds) {
+  const blank = () => ({ L: 0, R: 0, H: 0, Lo: 0, prior: 0 });
+  const all = blank(), byFlag = {};
+  for (let f = 1; f <= 5; f++) byFlag[f] = blank();
+  rounds.forEach(r => {
+    const dirs = r.miss || {};
+    roundOrder(r).forEach(k => {
+      if (r.results[k]) return;
+      const d = dirs[k];
+      const bucket = d && all[d] !== undefined ? d : "prior";
+      all[bucket] += 1; byFlag[r.flag][bucket] += 1;
+    });
+  });
+  const known = all.L + all.R + all.H + all.Lo;
+  const worst = known ? ["L", "R", "H", "Lo"].reduce((a, b) => (all[b] > all[a] ? b : a), "L") : null;
+  return { all, byFlag, known, prior: all.prior, worst };
+}
+
+const accOf = (rounds) => {
+  let m = 0, a = 0;
+  rounds.forEach(r => roundOrder(r).forEach(k => { m += r.results[k] ? 1 : 0; a += 1; }));
+  return { m, a };
+};
+
+// when you putt best: morning / midday / evening
+function timeOfDay(sessions) {
+  const buckets = {
+    morning: { label: "Morning", hint: "before noon", m: 0, a: 0 },
+    midday: { label: "Midday", hint: "12–5pm", m: 0, a: 0 },
+    evening: { label: "Evening", hint: "after 5pm", m: 0, a: 0 },
+  };
+  sessions.forEach(s => {
+    const h = new Date(s.startedAt).getHours();
+    const key = h < 12 ? "morning" : h < 17 ? "midday" : "evening";
+    const { m, a } = accOf(s.rounds);
+    buckets[key].m += m; buckets[key].a += a;
+  });
+  return buckets;
+}
+
+// do you fade as a session runs long?
+function fatigueCurve(sessions) {
+  const bands = [
+    { label: "1–5", lo: 0, hi: 5, m: 0, a: 0 },
+    { label: "6–10", lo: 5, hi: 10, m: 0, a: 0 },
+    { label: "11–20", lo: 10, hi: 20, m: 0, a: 0 },
+    { label: "21+", lo: 20, hi: Infinity, m: 0, a: 0 },
+  ];
+  sessions.forEach(s => s.rounds.forEach((r, i) => {
+    const b = bands.find(x => i >= x.lo && i < x.hi);
+    if (!b) return;
+    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+  }));
+  return bands.filter(b => b.a > 0);
+}
+
+// does rushing cost you? buckets rounds by how long they took
+function paceEffect(sessions) {
+  const bands = [
+    { label: "Quick", hint: "under 45s", max: 45, m: 0, a: 0 },
+    { label: "Steady", hint: "45s–2m", max: 120, m: 0, a: 0 },
+    { label: "Slow", hint: "over 2m", max: Infinity, m: 0, a: 0 },
+  ];
+  sessions.forEach(s => s.rounds.forEach(r => {
+    if (typeof r.dur !== "number") return;
+    const b = bands.find(x => r.dur < x.max);
+    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+  }));
+  return bands.filter(b => b.a > 0);
+}
+
+// how often a session ever reaches the top flag, and where you stall out
+function ceilingAnalysis(sessions) {
+  let reached5 = 0;
+  const stallRounds = {};
+  for (let f = 1; f <= 5; f++) stallRounds[f] = 0;
+  sessions.forEach(s => {
+    if (s.rounds.some(r => r.flag === 5)) reached5 += 1;
+    s.rounds.forEach(r => { stallRounds[r.flag] += 1; });
+  });
+  const busiest = Object.entries(stallRounds).sort((a, b) => b[1] - a[1])[0];
+  return {
+    reached5, sessions: sessions.length,
+    rate: sessions.length ? Math.round((100 * reached5) / sessions.length) : 0,
+    busiestFlag: busiest && busiest[1] > 0 ? +busiest[0] : null,
+    stallRounds,
+  };
+}
+
+// putting under pressure: rounds thrown while on watch
+function pressureSplit(sessions) {
+  const on = { m: 0, a: 0 }, off = { m: 0, a: 0 };
+  sessions.forEach(s => s.rounds.forEach(r => {
+    const b = r.prevWatch ? on : off;
+    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+  }));
+  return { on, off };
+}
+
 // ---------- storage ----------
 // IndexedDB is the primary store: iOS evicts localStorage far more readily,
 // which is what loses a session. localStorage is kept as a mirror so a failure
@@ -449,6 +551,7 @@ function Icon({ name, size = 15, style }) {
     cloud: <><path d="M7 18h10a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.6 1.3A3.6 3.6 0 0 0 7 18z" /></>,
     save: <><path d="M12 3v11" /><path d="M8 11l4 4 4-4" /><path d="M4 19h16" /></>,
     ruler: <><path d="M3 9h18v6H3z" /><path d="M7 9v3M11 9v4M15 9v3M19 9v4" /></>,
+    gear: <><circle cx="12" cy="12" r="3.2" /><path d="M12 3.5v2M12 18.5v2M20.5 12h-2M5.5 12h-2M18 6l-1.4 1.4M7.4 16.6 6 18M18 18l-1.4-1.4M7.4 7.4 6 6" /></>,
     pencil: <><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z" /><path d="M14.5 6.5l3 3" /></>,
     trash: <><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6.5 7l1 13h9l1-13" /></>,
     person: <><circle cx="12" cy="8" r="3.4" /><path d="M5 20a7 7 0 0 1 14 0" /></>,
@@ -483,15 +586,24 @@ const DIR_LABEL = { L: "left", R: "right", H: "high", Lo: "low" };
 
 // One putt: a big MADE target, plus a compact four-way pad for where it missed.
 // The pad reads as one unit, so it never competes with MADE for attention.
-function PuttRow({ label, sub, tint, value, dir, onMade, onMiss }) {
+function PuttRow({ label, sub, tint, value, dir, onMade, onMiss, onHoist, canHoist }) {
   const missed = value === false;
+  const Chip = canHoist ? "button" : "div";
   return (
     <div className="flex-1 flex gap-2 min-h-0">
-      <div className="flex flex-col items-center justify-center rounded-2xl"
-        style={{ width: 50, background: tint || "#EDEAE0", color: tint ? "#fff" : C.faint }}>
+      {/* the colour chip doubles as the reorder handle: tap to move this putter
+          up one slot, which reaches every order in at most two taps */}
+      <Chip
+        onClick={canHoist ? onHoist : undefined}
+        aria-label={canHoist ? `Move ${label} up one` : undefined}
+        className="relative flex flex-col items-center justify-center rounded-2xl"
+        style={{ width: 50, background: tint || "#EDEAE0", color: tint ? "#fff" : C.faint, border: "none" }}>
+        {canHoist && (
+          <span className="absolute" style={{ top: 4, ...disp, fontWeight: 800, fontSize: 12, opacity: 0.75 }}>↑</span>
+        )}
         <span style={{ ...disp, fontWeight: 800, fontSize: 17, letterSpacing: "0.04em" }}>{label}</span>
         {sub && <span style={{ fontSize: 10, opacity: 0.85 }}>{sub}</span>}
-      </div>
+      </Chip>
 
       <button onClick={onMade} className="rounded-2xl"
         style={{
@@ -531,11 +643,12 @@ function PuttRow({ label, sub, tint, value, dir, onMade, onMiss }) {
 // ---------- flight path ----------
 // The ladder drawn as a disc flight: a hyzer arc from the tee up to the basket,
 // with the five flags spaced along it and the disc parked on your current one.
-function FlightPath({ flag, watch, highest = 1 }) {
-  const W = 320, H = 112;
-  // Basket sits at the tee end; the line climbs away from it, so "farther out"
-  // reads as higher and further right. Control point gives it a disc's arc.
-  const p0 = { x: 58, y: H - 34 }, p1 = { x: 205, y: H - 30 }, p2 = { x: W - 22, y: 22 };
+// The ladder as a fairway: basket at the near end, flags marching away from it,
+// and — the good part — when a round lands, the three putts actually fly. Makes
+// arc into the chains, misses veer off in the direction you logged them.
+function FlightPath({ flag, watch, highest = 1, throwFx = null }) {
+  const W = 320, H = 118;
+  const p0 = { x: 62, y: H - 34 }, p1 = { x: 205, y: H - 30 }, p2 = { x: W - 22, y: 22 };
   const at = (t) => ({
     x: (1 - t) ** 2 * p0.x + 2 * (1 - t) * t * p1.x + t ** 2 * p2.x,
     y: (1 - t) ** 2 * p0.y + 2 * (1 - t) * t * p1.y + t ** 2 * p2.y,
@@ -544,17 +657,38 @@ function FlightPath({ flag, watch, highest = 1 }) {
   const disc = stops[flag - 1];
   const accent = watch ? C.amber : C.fairway;
   const path = `M${p0.x} ${p0.y} Q${p1.x} ${p1.y} ${p2.x} ${p2.y}`;
+  const basket = { x: 22, y: p0.y - 16 };
+
+  // flight paths for the putts of the round that just landed
+  const shots = throwFx ? throwFx.results : [];
+  const from = throwFx ? stops[throwFx.flag - 1] : null;
+  const made = shots.filter(Boolean).length;
+
+  const flightPath = (hit, dir, i) => {
+    if (!from) return "";
+    const lift = 26 + i * 5;                       // each putt takes a slightly different line
+    const cx = (from.x + basket.x) / 2, cy = Math.min(from.y, basket.y) - lift;
+    if (hit) return `M${from.x} ${from.y - 12} Q${cx} ${cy} ${basket.x + 2} ${basket.y + 4}`;
+    const off = { L: [-16, 8], R: [16, 6], H: [2, -18], Lo: [0, 22] }[dir] || [10, 14];
+    return `M${from.x} ${from.y - 12} Q${cx} ${cy} ${basket.x + 2 + off[0]} ${basket.y + 4 + off[1]}`;
+  };
 
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: "block" }} aria-hidden="true">
-      {/* basket at the near end */}
-      <g transform={`translate(${p0.x - 46} ${p0.y - 20})`} stroke={C.line} strokeWidth="1.6" fill="none" strokeLinecap="round">
-        <path d="M9 0v22" /><path d="M3 6h12" /><path d="M5 6l4 5 4-5" /><path d="M4 14h10l-1.5 3h-7z" />
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: "block", overflow: "visible" }} aria-hidden="true">
+      {/* basket: pole, chains, band, base */}
+      <g stroke={throwFx && made ? accent : C.line} strokeWidth="1.7" fill="none" strokeLinecap="round"
+        style={{ transition: "stroke 400ms" }} transform={`translate(${basket.x} ${basket.y})`}>
+        <path d="M9 -6v26" />
+        <path d="M2 0h14" />
+        <path d="M4 0l5 6 5-6" />
+        <path d="M4.5 0l1.5 6M13.5 0l-1.5 6" />
+        <path d="M3 9h12l-1.5 5h-9z" fill={throwFx && made ? `${C.fairway}22` : "transparent"} />
+        <path d="M5 20h8" />
       </g>
 
-      {/* the run ahead, faint */}
+      {/* the run ahead */}
       <path d={path} fill="none" stroke={C.line} strokeWidth="2" strokeDasharray="2.5 5" strokeLinecap="round" />
-      {/* the ground you've covered */}
+      {/* ground covered */}
       <path d={path} fill="none" stroke={accent} strokeWidth="2.5" strokeLinecap="round"
         pathLength="100" strokeDasharray="100"
         strokeDashoffset={100 - ((flag - 1) / 4) * 100}
@@ -574,13 +708,225 @@ function FlightPath({ flag, watch, highest = 1 }) {
         );
       })}
 
-      {/* the disc, hovering over the flag you're on */}
+      {/* discs in flight — one per putt of the round just logged */}
+      {throwFx && shots.map((hit, i) => (
+        <g key={`${throwFx.id}-${i}`} opacity="0">
+          <ellipse rx="6.5" ry="2.8" fill={hit ? C.fairway : C.miss} stroke={C.ink} strokeWidth="0.9" />
+          <animateMotion path={flightPath(hit, throwFx.dirs[i], i)} dur="0.62s"
+            begin={`${i * 0.16}s`} fill="freeze" rotate="auto" />
+          <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.08;0.82;1"
+            dur="0.85s" begin={`${i * 0.16}s`} fill="freeze" />
+        </g>
+      ))}
+
+      {/* your disc, parked on the flag you're on */}
       <g style={{ transition: "transform 520ms cubic-bezier(.22,.9,.3,1)" }}
         transform={`translate(${disc.x} ${disc.y - 13})`}>
         <ellipse rx="9.5" ry="4" fill={accent} stroke={C.ink} strokeWidth="1.1" />
         <ellipse rx="4.2" ry="1.5" fill="none" stroke={C.paper} strokeWidth="1" opacity="0.85" />
       </g>
     </svg>
+  );
+}
+
+// Secondary reporting: where misses go, overall and by flag. Rounds logged
+// before direction tracking existed are shown as "Prior" rather than hidden.
+function MissReport({ sessions, distances = {} }) {
+  const rounds = sessions.flatMap(s => s.rounds);
+  const m = missAnalysis(rounds);
+  if (!m.known && !m.prior) return null;
+  const pct = (n) => (m.known ? Math.round((100 * n) / m.known) : 0);
+
+  const zone = (k, label) => {
+    const n = m.all[k];
+    return (
+      <div className="rounded-xl py-2 text-center"
+        style={{ background: n ? `rgba(206,47,47,${0.06 + 0.34 * (m.known ? n / m.known : 0)})` : "#FAF8F2", border: `1px solid ${C.line}` }}>
+        <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{m.known ? `${pct(n)}%` : "—"}</div>
+        <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
+      </div>
+    );
+  };
+
+  return (
+    <StatBlock title="Where the misses go" icon="target">
+      {m.known > 0 ? (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+            <div />{zone("H", "high")}<div />
+            {zone("L", "left")}
+            <div className="flex items-center justify-center" style={{ color: C.line }}><Icon name="basket" size={28} /></div>
+            {zone("R", "right")}
+            <div />{zone("Lo", "low")}<div />
+          </div>
+          <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
+            {m.known} directional miss{m.known > 1 ? "es" : ""} — most often {DIR_LABEL[m.worst]}.
+          </div>
+
+          {/* the interesting part: does the bias change with distance? */}
+          <div style={{ ...disp, fontWeight: 700, fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase", color: C.faint }} className="mt-3 mb-1">
+            By flag
+          </div>
+          {[1, 2, 3, 4, 5].map(f => {
+            const b = m.byFlag[f], tot = b.L + b.R + b.H + b.Lo;
+            if (!tot) return null;
+            const seg = [["L", C.amber], ["R", C.red], ["H", "#7FA98C"], ["Lo", C.miss]];
+            const lead = seg.map(([k]) => k).reduce((a, k) => (b[k] > b[a] ? k : a), "L");
+            return (
+              <div key={f} className="flex items-center gap-2 py-1">
+                <span style={{ ...disp, fontWeight: 700, fontSize: 14, width: 44, color: C.faint }}>
+                  {distances[f] ? `${distances[f]}ft` : `F${f}`}
+                </span>
+                <div className="flex-1 flex h-3 rounded-full overflow-hidden" style={{ background: "#EDEAE0" }}>
+                  {seg.map(([k, col]) => b[k] ? (
+                    <div key={k} style={{ width: `${(100 * b[k]) / tot}%`, background: col }} title={DIR_LABEL[k]} />
+                  ) : null)}
+                </div>
+                <span style={{ fontSize: 11, color: C.faint, width: 60, textAlign: "right" }}>{tot} · {DIR_LABEL[lead]}</span>
+              </div>
+            );
+          })}
+          <div className="flex flex-wrap gap-2 mt-2">
+            {[["L", C.amber, "left"], ["R", C.red, "right"], ["H", "#7FA98C", "high"], ["Lo", C.miss, "low"]].map(([k, col, lbl]) => (
+              <span key={k} className="flex items-center gap-1" style={{ fontSize: 11, color: C.faint }}>
+                <span style={{ width: 9, height: 9, borderRadius: 3, background: col, display: "inline-block" }} />{lbl}
+              </span>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div style={{ fontSize: 13, color: C.faint }}>No directional misses logged yet — they start appearing as you use the arrow pad.</div>
+      )}
+
+      {m.prior > 0 && (
+        <div className="rounded-xl px-3 py-2 mt-3" style={{ background: "#FAF8F2", border: `1px dashed ${C.line}`, fontSize: 12, color: C.faint }}>
+          <strong style={{ color: C.ink }}>Prior:</strong> {m.prior} miss{m.prior > 1 ? "es" : ""} logged before direction tracking, counted in totals but not in the zones above.
+        </div>
+      )}
+    </StatBlock>
+  );
+}
+
+// When you putt well: time of day, how deep into a session, and pace.
+function RhythmReport({ sessions }) {
+  const tod = timeOfDay(sessions), fat = fatigueCurve(sessions), pace = paceEffect(sessions);
+  const pc = (b) => (b.a ? Math.round((100 * b.m) / b.a) : null);
+  const row = (items, keyf, labelf, hintf) => (
+    <div className="flex gap-2">
+      {items.map((b, i) => {
+        const v = pc(b);
+        return (
+          <div key={keyf(b, i)} className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
+            <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{v === null ? "—" : `${v}%`}</div>
+            <div style={{ fontSize: 11, color: C.faint }}>{labelf(b, i)}</div>
+            {hintf && <div style={{ fontSize: 10, color: C.line }}>{hintf(b, i)}</div>}
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const todList = Object.values(tod).filter(b => b.a > 0);
+  const best = todList.length > 1 ? todList.reduce((a, b) => (pc(b) > pc(a) ? b : a)) : null;
+
+  return (
+    <StatBlock title="Your rhythm" icon="clock">
+      {todList.length > 0 && (
+        <>
+          {row(todList, b => b.label, b => b.label, b => b.hint)}
+          {best && <div style={{ fontSize: 12, color: C.faint }} className="mt-2">Sharpest in the {best.label.toLowerCase()}.</div>}
+        </>
+      )}
+
+      {fat.length > 1 && (
+        <>
+          <div style={{ ...disp, fontWeight: 700, fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase", color: C.faint }} className="mt-3 mb-1">
+            How deep into a session
+          </div>
+          {row(fat, b => b.label, b => `rd ${b.label}`)}
+        </>
+      )}
+
+      {pace.length > 1 && (
+        <>
+          <div style={{ ...disp, fontWeight: 700, fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase", color: C.faint }} className="mt-3 mb-1">
+            Pace per round
+          </div>
+          {row(pace, b => b.label, b => b.label, b => b.hint)}
+          <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
+            Whether taking your time actually helps, in your own numbers.
+          </div>
+        </>
+      )}
+    </StatBlock>
+  );
+}
+
+// The ladder itself: how often you top out, where you stall, and pressure putting.
+function CeilingReport({ sessions }) {
+  const c = ceilingAnalysis(sessions);
+  const p = pressureSplit(sessions);
+  const pc = (b) => (b.a ? Math.round((100 * b.m) / b.a) : null);
+  const onPc = pc(p.on), offPc = pc(p.off);
+  const delta = onPc !== null && offPc !== null ? onPc - offPc : null;
+  return (
+    <StatBlock title="The ladder" icon="climb">
+      <div className="flex gap-2">
+        <div className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
+          <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{c.rate}%</div>
+          <div style={{ fontSize: 11, color: C.faint }}>sessions reaching flag 5</div>
+        </div>
+        <div className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
+          <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{c.busiestFlag ?? "—"}</div>
+          <div style={{ fontSize: 11, color: C.faint }}>flag you live on</div>
+        </div>
+        <div className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
+          <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{onPc === null ? "—" : `${onPc}%`}</div>
+          <div style={{ fontSize: 11, color: C.faint }}>while on watch</div>
+        </div>
+      </div>
+      {delta !== null && p.on.a >= 6 && (
+        <div style={{ fontSize: 12, color: delta >= 3 ? C.fairway : delta <= -3 ? C.red : C.faint }} className="mt-2">
+          {delta >= 3
+            ? `You rise under pressure — +${delta} pts on watch rounds.`
+            : delta <= -3
+              ? `Pressure costs you ${Math.abs(delta)} pts on watch rounds.`
+              : "Pressure doesn't move your numbers much."}
+        </div>
+      )}
+    </StatBlock>
+  );
+}
+
+function TabBar({ tab, setTab }) {
+  const tabs = [
+    { k: "home", label: "Play", icon: "basket" },
+    { k: "stats", label: "Stats", icon: "chart" },
+    { k: "board", label: "Board", icon: "trophy" },
+    { k: "settings", label: "Settings", icon: "gear" },
+  ];
+  return (
+    <div style={{
+      position: "sticky", bottom: 0, zIndex: 20,
+      background: "rgba(246,244,237,0.94)", backdropFilter: "blur(8px)",
+      borderTop: `1px solid ${C.line}`,
+      paddingBottom: "env(safe-area-inset-bottom)",
+    }}>
+      <div className="flex max-w-md mx-auto">
+        {tabs.map(t => {
+          const on = tab === t.k;
+          return (
+            <button key={t.k} onClick={() => setTab(t.k)} aria-label={t.label}
+              className="flex-1 flex flex-col items-center gap-0.5"
+              style={{ padding: "9px 0 7px", color: on ? C.fairway : C.faint }}>
+              <Icon name={t.icon} size={20} />
+              <span style={{ ...disp, fontWeight: on ? 800 : 600, fontSize: 12, letterSpacing: "0.03em" }}>{t.label}</span>
+              <span style={{ width: 16, height: 2, borderRadius: 2, background: on ? C.fairway : "transparent" }} />
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -890,11 +1236,13 @@ function Progression({ rounds }) {
 
 // ---------- app ----------
 export default function App() {
-  const [view, setView] = useState("home"); // home | session | detail
+  const [view, setView] = useState("home");
+  const [tab, setTab] = useState("home"); // home | session | detail
   const [sessions, setSessions] = useState([]);
   const [active, setActive] = useState(null); // {startedAt, flag, watch, rounds, order, anchor}
   const [pending, setPending] = useState({ orange: null, red: null, green: null });
   const [pendingDir, setPendingDir] = useState({});
+  const [throwFx, setThrowFx] = useState(null);
   const [gamePending, setGamePending] = useState([null, null, null]);
   const [gameDir, setGameDir] = useState({});
   const [playerName, setPlayerName] = useState("Me");
@@ -1105,13 +1453,17 @@ export default function App() {
     setConfirmEnd(false); setView("session");
   };
 
-  const throwFirst = (key) => {
+  // move one putter up a slot; repeat taps reach any of the six orders
+  const hoist = (key) => {
     if (committing.current) return;
     setActive(prev => {
-      if (roundOrder(prev)[0] === key) return prev;
-      const order = [key, ...(prev.order || DEFAULT_ORDER).filter(k => k !== key)];
+      const order = [...(prev.order || DEFAULT_ORDER)];
+      const i = order.indexOf(key);
+      if (i <= 0) return prev;
+      [order[i - 1], order[i]] = [order[i], order[i - 1]];
       const next = { ...prev, order };
       saveKey("dg-active", next);
+      buzz([12]);
       return next;
     });
   };
@@ -1137,19 +1489,31 @@ export default function App() {
   };
 
   const commitRound = (p) => {
+    const dirs = { ...missDirRef.current };
     setActive(prev => {
       const now = Date.now();
       const made = DEFAULT_ORDER.reduce((n, k) => n + (p[k] ? 1 : 0), 0);
       const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
       const dur = Math.max(0, (now - (prev.anchor || prev.startedAt)) / 1000);
       const round = {
-        flag: prev.flag, results: { ...p }, miss: { ...missDirRef.current }, made,
+        flag: prev.flag, results: { ...p }, miss: dirs, made,
         prevFlag: prev.flag, prevWatch: prev.watch,
         order: [...(prev.order || DEFAULT_ORDER)], dur, t: now,
       };
       const next = { ...prev, flag: nf, watch: nw, rounds: [...prev.rounds, round], anchor: now, pending: null };
       const pattern = nf > prev.flag ? [40, 60, 40, 60, 80] : nf < prev.flag ? [180] : made >= 2 ? [30] : [60, 50, 60];
-      queueMicrotask(() => { saveKey("dg-active", next); setBanner(`${msg} · ${fmtClock(dur)}`); buzz(pattern); });
+      queueMicrotask(() => {
+        saveKey("dg-active", next);
+        setBanner(`${msg} · ${fmtClock(dur)}`);
+        buzz(pattern);
+        const order = roundOrder(prev);
+        setThrowFx({
+          id: now, flag: prev.flag,
+          results: order.map(k => !!p[k]),
+          dirs: order.map(k => dirs[k] || null),
+        });
+        setTimeout(() => setThrowFx(f => (f && f.id === now ? null : f)), 1400);
+      });
       return next;
     });
     setPending({ orange: null, red: null, green: null });
@@ -1226,14 +1590,18 @@ export default function App() {
   };
 
   const commitGameRound = (p) => {
+    const dirs = { ...gameDirRef.current };
     setGame(prev => {
       const made = p.reduce((n, v) => n + (v ? 1 : 0), 0);
       const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
       const pts = made * flagPts(prev.flag);
-      const round = { flag: prev.flag, made, putts: [...p], miss: { ...gameDirRef.current }, prevFlag: prev.flag, prevWatch: prev.watch };
+      const round = { flag: prev.flag, made, putts: [...p], miss: dirs, prevFlag: prev.flag, prevWatch: prev.watch };
       const next = { ...prev, flag: nf, watch: nw, rounds: [...prev.rounds, round], pending: null };
       queueMicrotask(() => {
         setBanner(`${made}/3 at flag ${prev.flag} — +${pts} pts · ${msg.replace(/^\d\/3 — /, "")}`);
+        const fxId = Date.now();
+        setThrowFx({ id: fxId, flag: prev.flag, results: p.map(v => !!v), dirs: [0, 1, 2].map(i => dirs[i] || null) });
+        setTimeout(() => setThrowFx(f => (f && f.id === fxId ? null : f)), 1400);
         buzz(nf > prev.flag ? [40, 60, 40, 60, 80] : nf < prev.flag ? [180] : made >= 2 ? [30] : [60, 50, 60]);
         if (next.rounds.length >= GAME_ROUNDS) finishGame(next);
         else saveKey("dg-game-active", next);
@@ -1354,7 +1722,7 @@ export default function App() {
         </div>
 
         {/* flag rail + current flag */}
-        <FlightPath flag={active.flag} watch={active.watch} highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)} />
+        <FlightPath flag={active.flag} watch={active.watch} highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)} throwFx={throwFx} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 38, lineHeight: 1 }}>FLAG {active.flag}</span>
           {ft(active.flag) && <span style={{ ...disp, fontWeight: 700, fontSize: 20, color: C.faint }} className="ml-2">{ft(active.flag)}</span>}
@@ -1362,7 +1730,7 @@ export default function App() {
 
         {/* banner */}
         <div className="rounded-xl px-3 py-2 text-center mb-2" style={{ background: banner ? C.ink : "#EDEAE0", color: banner ? "#fff" : C.faint, ...disp, fontWeight: 700, fontSize: 17, minHeight: 38 }}>
-          {banner || `Tap MADE, or the arrow for where it missed (${answered}/3)`}
+          {banner || `Tap MADE, or an arrow for where it missed (${answered}/3)`}
         </div>
 
         {/* one row per putter, in throw order */}
@@ -1375,27 +1743,14 @@ export default function App() {
               tint={DISC[k].color}
               value={pending[k]}
               dir={pendingDir[k]}
+              canHoist={i > 0 && pending[k] === null}
+              onHoist={() => hoist(k)}
               onMade={() => answer(k, true)}
               onMiss={(d) => answer(k, false, d)}
             />
           ))}
         </div>
 
-        {/* reorder: only shown before the round starts, so it never gets in the way */}
-        {answered === 0 && (
-          <div className="flex items-center gap-1.5 mt-2">
-            <span style={{ fontSize: 11, color: C.faint }}>Throw first:</span>
-            {DEFAULT_ORDER.map(k => (
-              <button key={k} onClick={() => throwFirst(k)} className="rounded-full px-2.5 py-1"
-                style={{
-                  background: order[0] === k ? DISC[k].color : "transparent",
-                  color: order[0] === k ? "#fff" : C.faint,
-                  border: `1.5px solid ${order[0] === k ? DISC[k].color : C.line}`,
-                  ...disp, fontWeight: 700, fontSize: 13,
-                }}>{DISC[k].label}</button>
-            ))}
-          </div>
-        )}
 
         {/* undo */}
         <button onClick={undo} disabled={active.rounds.length === 0} className="mt-2 rounded-2xl py-3 w-full"
@@ -1432,7 +1787,7 @@ export default function App() {
         </div>
 
         {/* flag rail */}
-        <FlightPath flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} />
+        <FlightPath flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} throwFx={throwFx} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 34, lineHeight: 1 }}>FLAG {game.flag}</span>
           <span style={{ ...disp, fontWeight: 700, fontSize: 19, color: C.fairway }} className="ml-2">
@@ -1481,7 +1836,7 @@ export default function App() {
     const isLadderRun = Array.isArray(g.rounds);
     return shell(
       <div className="px-4 pt-4 pb-8 max-w-md mx-auto">
-        <button onClick={() => { setConfirmDelete(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Home</button>
+        <button onClick={() => { setConfirmDelete(false); setEditing(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Back</button>
         <div className="flex items-center gap-2">
           <Icon name="trophy" size={24} style={{ color: C.fairway }} />
           <span style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>Scored run</span>
@@ -1549,7 +1904,7 @@ export default function App() {
     const totalSec = s.endedAt ? (s.endedAt - s.startedAt) / 1000 : null;
     return shell(
       <div className="px-4 pt-4 pb-8 max-w-md mx-auto">
-        <button onClick={() => { setConfirmDelete(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Home</button>
+        <button onClick={() => { setConfirmDelete(false); setEditing(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Back</button>
         <div className="flex items-center gap-2">
           <Icon name="clock" size={24} style={{ color: C.fairway }} />
           <span style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>Session post mortem</span>
@@ -1626,89 +1981,163 @@ export default function App() {
     );
   }
 
-  // ----- HOME / HISTORY -----
-  return shell(
-    <div className="px-4 pt-6 pb-8 max-w-md mx-auto">
+  // ----- TABBED SHELL: Play / Stats / Board / Settings -----
+  const allSessionRounds = sessions.map(x => x.rounds);
+  const lastSession = sessions[sessions.length - 1];
+
+  const page = (children) => shell(
+    <div className="flex flex-col" style={{ minHeight: "100dvh" }}>
+      <div className="flex-1 px-4 pt-5 pb-6 max-w-md mx-auto w-full">{children}</div>
+      <TabBar tab={tab} setTab={setTab} />
+    </div>
+  );
+
+  const header = (title, sub) => (
+    <>
       <div className="flex items-center gap-2">
-        <Icon name="basket" size={32} style={{ color: C.fairway }} />
-        <span style={{ ...disp, fontWeight: 800, fontSize: 40, lineHeight: 1 }}>Putting yard</span>
+        <Icon name="basket" size={26} style={{ color: C.fairway }} />
+        <span style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1 }}>{title}</span>
       </div>
-      <div style={{ fontSize: 14, color: C.faint }} className="mb-4">
-        5 flags · 3 putters · earn your distance
-      </div>
+      {sub && <div style={{ fontSize: 13, color: C.faint }} className="mb-4">{sub}</div>}
+    </>
+  );
 
-      {active ? (
-        <button onClick={resumeSession} className="w-full rounded-2xl py-4 mb-3" style={{ background: C.amber, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>
-          Resume session — round {active.rounds.length + 1}, flag {active.flag}
-        </button>
-      ) : (
-        <button onClick={startSession} className="w-full rounded-2xl py-4 mb-3" style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>
-          Start session
-        </button>
-      )}
+  // ---- PLAY ----
+  if (tab === "home") {
+    const streakNow = lastSession ? computeStats([lastSession.rounds]).bestStreak : 0;
+    return page(
+      <>
+        {header("Putting yard", "5 flags · 3 putters · earn your distance")}
 
-      {game ? (
-        <button onClick={resumeGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
-          Resume run — round {game.rounds.length + 1}/{GAME_ROUNDS} · flag {game.flag} · {gameScore(game)} pts
-        </button>
-      ) : (
-        <button onClick={startGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
-          Play scored run — 10 rounds
-        </button>
-      )}
+        {active ? (
+          <button onClick={resumeSession} className="w-full rounded-2xl py-4 mb-3" style={{ background: C.amber, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>
+            Resume session — round {active.rounds.length + 1}, flag {active.flag}
+          </button>
+        ) : (
+          <button onClick={startSession} className="w-full rounded-2xl py-4 mb-3" style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>
+            Start session
+          </button>
+        )}
 
-      {games.length > 0 && (
-        <>
-          <div className="flex items-center gap-1.5 mt-5 mb-2" style={{ color: C.faint }}>
-            <Icon name="trophy" size={16} />
-            <span style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              Scored runs · best {Math.max(...games.map(g => gameScore(g)))} pts
-            </span>
-          </div>
-          <Leaderboard
-            board={leaderboard(games)}
-            games={games}
-            onPick={(i) => { setGameIdx(i); setConfirmDelete(false); setView("gamedetail"); }}
-          />
-        </>
-      )}
+        {game ? (
+          <button onClick={resumeGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
+            Resume run — round {game.rounds.length + 1}/{GAME_ROUNDS} · flag {game.flag} · {gameScore(game)} pts
+          </button>
+        ) : (
+          <button onClick={startGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
+            Play scored run — 10 rounds
+          </button>
+        )}
 
-      {sessions.length > 0 && (
-        <>
-          <div style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mt-5 mb-2">All-time · {sessions.length} session{sessions.length > 1 ? "s" : ""}</div>
-          <TrendBlock sessions={sessions} />
-          <PersonalBests sessions={sessions} />
-          <StatsBody segments={sessions.map(s => s.rounds)} distances={distances} />
-
-          <div className="flex items-center gap-1.5 mt-5 mb-2" style={{ color: C.faint }}>
-            <Icon name="clock" size={16} />
-            <span style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase" }}>Sessions</span>
-          </div>
-          {sessions.map((s, i) => {
-            const st = computeStats([s.rounds]);
-            const madeAll = s.rounds.reduce((n, r) => n + r.made, 0);
-            const durTxt = s.endedAt ? fmtDur((s.endedAt - s.startedAt) / 1000) : null;
-            return (
-              <button key={s.startedAt} onClick={() => { setDetailIdx(i); setConfirmDelete(false); setView("detail"); }}
-                className="w-full rounded-2xl p-3 mb-2 flex items-center justify-between text-left"
+        {/* at-a-glance, so the Play tab still says something useful */}
+        {sessions.length > 0 && (() => {
+          const st = computeStats(allSessionRounds);
+          const last = computeStats([lastSession.rounds]);
+          return (
+            <>
+              <div className="flex gap-2 mt-4 mb-3">
+                <BigNum label="Sessions" value={sessions.length} />
+                <BigNum label="Putts" value={st.total * 3} />
+                <BigNum label="Best streak" value={st.bestStreak || "—"} />
+              </div>
+              <button onClick={() => { setDetailIdx(sessions.length - 1); setConfirmDelete(false); setView("detail"); }}
+                className="w-full rounded-2xl p-3 flex items-center justify-between text-left"
                 style={{ background: C.card, border: `1px solid ${C.line}` }}>
                 <div>
-                  <div style={{ fontWeight: 600, fontSize: 15 }}>{fmtDate(s.startedAt)}{durTxt ? ` · ${durTxt}` : ""}</div>
-                  <div style={{ fontSize: 13, color: C.faint }}>{st.total} rounds · {madeAll}/{st.total * 3} putts · high flag {st.highest}</div>
+                  <div style={{ ...disp, fontWeight: 700, fontSize: 15 }}>Last session</div>
+                  <div style={{ fontSize: 13, color: C.faint }}>
+                    {fmtDate(lastSession.startedAt)} · {last.total} rounds · high flag {last.highest}
+                  </div>
                 </div>
                 <span style={{ color: C.faint }}>›</span>
               </button>
-            );
-          }).reverse()}
-        </>
-      )}
+            </>
+          );
+        })()}
 
-      {sessions.length === 0 && !active && (
-        <div className="rounded-2xl p-4 mt-2 mb-3" style={{ background: C.card, border: `1px solid ${C.line}`, fontSize: 14, color: C.faint, lineHeight: 1.5 }}>
-          No sessions yet. Start one, log each round with three taps, and your stats build here automatically.
+        {sessions.length === 0 && !active && (
+          <div className="rounded-2xl p-4 mt-2" style={{ background: C.card, border: `1px solid ${C.line}`, fontSize: 14, color: C.faint, lineHeight: 1.5 }}>
+            Nothing logged yet. Start a session, tap three putts a round, and your stats build themselves.
+          </div>
+        )}
+      </>
+    );
+  }
+
+  // ---- STATS ----
+  if (tab === "stats") {
+    if (!sessions.length) return page(
+      <>
+        {header("Stats", "practice history")}
+        <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}`, fontSize: 14, color: C.faint }}>
+          Log a session and this fills in.
         </div>
-      )}
+      </>
+    );
+    return page(
+      <>
+        {header("Stats", `${sessions.length} session${sessions.length > 1 ? "s" : ""} · ${computeStats(allSessionRounds).total} rounds`)}
+        <TrendBlock sessions={sessions} />
+        <PersonalBests sessions={sessions} />
+        <MissReport sessions={sessions} distances={distances} />
+        <RhythmReport sessions={sessions} />
+        <CeilingReport sessions={sessions} />
+        <StatsBody segments={allSessionRounds} distances={distances} />
 
+        <div style={{ ...disp, fontWeight: 700, fontSize: 16, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mt-5 mb-2">Sessions</div>
+        {sessions.map((sn, i) => {
+          const st = computeStats([sn.rounds]);
+          const madeAll = sn.rounds.reduce((n, r) => n + r.made, 0);
+          const durTxt = sn.endedAt ? fmtDur((sn.endedAt - sn.startedAt) / 1000) : null;
+          return (
+            <button key={sn.startedAt} onClick={() => { setDetailIdx(i); setConfirmDelete(false); setView("detail"); }}
+              className="w-full rounded-2xl p-3 mb-2 flex items-center justify-between text-left"
+              style={{ background: C.card, border: `1px solid ${C.line}` }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: 15 }}>{fmtDate(sn.startedAt)}{durTxt ? ` · ${durTxt}` : ""}</div>
+                <div style={{ fontSize: 13, color: C.faint }}>{st.total} rounds · {madeAll}/{st.total * 3} putts · high flag {st.highest}</div>
+              </div>
+              <span style={{ color: C.faint }}>›</span>
+            </button>
+          );
+        }).reverse()}
+      </>
+    );
+  }
+
+  // ---- BOARD ----
+  if (tab === "board") {
+    return page(
+      <>
+        {header("Board", games.length ? `${games.length} scored run${games.length > 1 ? "s" : ""}` : "scored runs")}
+        {games.length === 0 ? (
+          <div className="rounded-2xl p-4" style={{ background: C.card, border: `1px solid ${C.line}`, fontSize: 14, color: C.faint, lineHeight: 1.5 }}>
+            No runs yet. A scored run is ten ladder rounds where every make scores the flag number — 120 is perfect.
+          </div>
+        ) : (
+          <>
+            <div className="flex gap-2 mb-3">
+              <BigNum label="Best" value={Math.max(...games.map(g => gameScore(g)))} />
+              <BigNum label="Average" value={Math.round(games.reduce((n, g) => n + gameScore(g), 0) / games.length)} />
+              <BigNum label="Runs" value={games.length} />
+            </div>
+            <Leaderboard board={leaderboard(games)} games={games} limit={20}
+              onPick={(i) => { setGameIdx(i); setConfirmDelete(false); setView("gamedetail"); }} />
+          </>
+        )}
+        {!game && (
+          <button onClick={startGame} className="w-full rounded-2xl py-3 mt-1" style={{ background: C.ink, color: "#fff", ...disp, fontWeight: 800, fontSize: 19 }}>
+            Play a scored run
+          </button>
+        )}
+      </>
+    );
+  }
+
+  // ---- SETTINGS ----
+  return page(
+    <>
+      {header("Settings", "set once, forget it")}
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
         <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
           <Icon name="person" size={14} />
@@ -1724,7 +2153,6 @@ export default function App() {
           Scored runs are filed under this name. Change it before handing the phone to someone else and you'll both show up on the board.
         </div>
       </div>
-
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
         <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
           <Icon name="ruler" size={14} />
@@ -1746,7 +2174,6 @@ export default function App() {
         </div>
         <div style={{ fontSize: 12, color: C.faint }} className="mt-2">Set once — distances show on the session screen and in your flag stats.</div>
       </div>
-
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
         <div className="flex items-center justify-between mb-2">
           <div className="flex items-center gap-1.5" style={{ color: C.faint }}>
@@ -1776,7 +2203,6 @@ export default function App() {
           </div>
         )}
       </div>
-
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
         <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
           <Icon name="save" size={14} />
@@ -1801,11 +2227,10 @@ export default function App() {
         </div>
       </div>
 
-      <div className="flex items-center justify-center gap-1.5 mt-4" style={{ color: C.line }}>
-        <Icon name="disc" size={13} />
+      <div className="flex items-center justify-center gap-1.5 mt-4">
+        <Icon name="disc" size={13} style={{ color: C.line }} />
         <span style={{ fontSize: 12, color: C.faint }}>{BUILD}</span>
       </div>
-
-    </div>
+    </>
   );
 }
