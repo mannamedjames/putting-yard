@@ -39,12 +39,53 @@ Open the page → tap the ⋮ menu → **Install app** (or **Add to Home Screen*
 Launch it from the icon and it opens full screen with no browser chrome, and
 works with no signal.
 
+
+## Cloud sync (recommended on iPhone)
+
+iOS can evict a web app's local data, which is how a session disappears an hour
+after you logged it. The app now stores everything in two places on the device
+(IndexedDB plus a localStorage mirror), and can also sync to a GitHub repo so
+your history survives a wipe or a new phone entirely.
+
+Setting it up takes about three minutes:
+
+1. On GitHub, create a **second, private** repository — e.g. `putting-data`.
+   Keep it separate from the public one hosting the app, so your history isn't
+   public. Tick "Add a README file" so the repo isn't empty.
+2. Go to **Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token**.
+   - Expiration: whatever you like (you'll re-enter it when it lapses).
+   - Repository access: **Only select repositories** → pick `putting-data`.
+   - Permissions: **Repository permissions → Contents → Read and write**.
+   - Generate, then copy the `github_pat_...` string.
+3. In the app, open the **Cloud sync** card at the bottom of the home screen,
+   tap **Set up cloud sync**, and enter your GitHub username, the repo name
+   (`putting-data`), and the token. Tap **Connect and sync**.
+
+After that it syncs automatically whenever you finish a session or a game, and
+pulls on open. There's a **Sync now** button for a manual push.
+
+The token is stored on your device only and is never written into the repo.
+It can only touch that one private repo, so the worst case if it leaked is
+someone editing your putting stats. If you ever want it dead, delete the token
+on GitHub and tap Disconnect in the app.
+
+**Setting up a new phone:** install the app, open Cloud sync, enter the same
+three values. Your full history downloads on connect.
+
+### About the synced file
+
+Rounds are stored in a packed form — each round becomes a short array of
+numbers rather than a verbose object. A typical session is a few hundred bytes,
+so years of practice stay well under a megabyte, and every sync is a single
+small commit.
+
 ## Your data
 
 Sessions and games are stored on the device, in that browser's local storage.
 That means:
 
-- Data does **not** sync between your phone and your laptop.
+- Without cloud sync, data does **not** move between your phone and laptop.
 - Deleting the app from your home screen is fine, but clearing your browser's
   site data will erase your history.
 - **Use the backup buttons.** *Save backup file* downloads a `.json` of
