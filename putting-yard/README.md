@@ -41,6 +41,13 @@ Launch it from the icon and it opens full screen with no browser chrome, and
 works with no signal.
 
 
+## Getting around
+
+Four tabs across the bottom: **Play** (start a session or a scored run),
+**Stats** (everything the app has learned about your putting), **Board**
+(scored-run leaderboard), and **Settings** (name, flag distances, shared data,
+backups).
+
 ## The two modes
 
 **Session** is open-ended ladder practice: three putters a round, advance on

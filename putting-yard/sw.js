@@ -3,7 +3,7 @@
 // deploy shows up on the very next launch, with the cache as the offline
 // fallback. Icons and fonts stay cache-first since they rarely change.
 
-const CACHE = "putting-yard-v6";
+const CACHE = "putting-yard-v7";
 const ASSETS = [
   "./",
   "./index.html",
