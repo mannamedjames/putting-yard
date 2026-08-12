@@ -3,7 +3,7 @@
 // deploy shows up on the very next launch, with the cache as the offline
 // fallback. Icons and fonts stay cache-first since they rarely change.
 
-const CACHE = "putting-yard-v7";
+const CACHE = "putting-yard-v11";
 const ASSETS = [
   "./",
   "./index.html",
@@ -42,6 +42,10 @@ self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
   const url = new URL(e.request.url);
   const isFont = url.hostname === "fonts.googleapis.com" || url.hostname === "fonts.gstatic.com";
+
+  // Never touch cross-origin API traffic (sync backends). Caching those would
+  // hand back stale data, and they must always hit the network.
+  if (url.origin !== self.location.origin && !isFont) return;
 
   // the app itself: try the network first, fall back to cache when offline
   if (isPage(e.request)) {
