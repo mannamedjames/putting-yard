@@ -24,7 +24,7 @@ const DISC = {
 const DEFAULT_ORDER = ["orange", "red", "green"];
 // Bump this every release. It's shown at the bottom of the home screen so you
 // can tell at a glance whether your phone picked up a new deploy.
-const BUILD = "v5 · icons + scored runs";
+const BUILD = "v6 · flight path, miss zones, shared data";
 const disp = { fontFamily: "'Barlow Condensed', sans-serif" };
 
 const body = { fontFamily: "'Barlow', sans-serif" };
@@ -123,6 +123,17 @@ function computeStats(segments) {
   let watchSaved = 0, watchLost = 0;
   rounds.forEach(r => { if (r.prevWatch) (r.made >= 2 ? watchSaved++ : watchLost++); });
 
+  // where the misses go
+  const missDirs = { L: 0, R: 0, H: 0, Lo: 0, unknown: 0 };
+  rounds.forEach(r => {
+    const dirs = r.miss || {};
+    roundOrder(r).forEach(k => {
+      if (r.results[k]) return;
+      const d = dirs[k];
+      if (d && missDirs[d] !== undefined) missDirs[d] += 1; else missDirs.unknown += 1;
+    });
+  });
+
   // warm-up effect: first 3 rounds of each session vs the rest
   const early = { m: 0, a: 0 }, late = { m: 0, a: 0 };
   segments.forEach(seg => seg.forEach((r, i) => roundOrder(r).forEach(k => {
@@ -135,7 +146,7 @@ function computeStats(segments) {
   const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null;
   const totalDur = durs.length ? durs.reduce((a, b) => a + b, 0) : null;
 
-  return { perFlag, perColor, grid, perPos, highest, total: rounds.length, bestStreak, adv, watchSaved, watchLost, avgDur, totalDur, early, late };
+  return { perFlag, perColor, grid, perPos, highest, total: rounds.length, bestStreak, adv, watchSaved, watchLost, avgDur, totalDur, early, late, missDirs };
 }
 
 function currentStreak(rounds) {
@@ -376,46 +387,34 @@ function mergeRecords(a, b, sizeOf) {
   return [...by.values()].sort((x, y) => x.startedAt - y.startedAt);
 };
 
-// ---------- GitHub sync ----------
-// Commits a single JSON file to a repo you own using a fine-grained token.
-const b64encode = (str) => btoa(unescape(encodeURIComponent(str)));
-const b64decode = (str) => decodeURIComponent(escape(atob(str.replace(/\s/g, ""))));
+// ---------- shared database ----------
+// Set once in config.js and baked into the deploy, so every device that opens
+// the app shares one data set with nothing to log into.
+const dbBase = () => {
+  const raw = (typeof window !== "undefined" && window.PUTTING_DB) || "";
+  return raw ? raw.replace(/\/+$/, "") : "";
+};
+const dbBucket = () => (typeof window !== "undefined" && window.PUTTING_BUCKET) || "yard";
+const dbConfigured = () => !!dbBase();
+const dbUrl = () => `${dbBase()}/${dbBucket()}.json`;
 
-async function ghRequest(cfg, method, extra) {
-  const url = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${cfg.path}`;
-  const res = await fetch(method === "GET" ? `${url}?ref=${encodeURIComponent(cfg.branch || "main")}&t=${Date.now()}` : url, {
-    method,
-    headers: {
-      Authorization: `Bearer ${cfg.token}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      ...(method === "PUT" ? { "Content-Type": "application/json" } : {}),
-    },
-    ...(extra ? { body: JSON.stringify(extra) } : {}),
-  });
-  return res;
-}
-
-async function ghPull(cfg) {
-  const res = await ghRequest(cfg, "GET");
-  if (res.status === 404) return { data: null, sha: null };       // nothing saved yet
-  if (res.status === 401) throw new Error("Token rejected — check it hasn't expired.");
-  if (res.status === 403) throw new Error("Token lacks Contents write access to this repo.");
-  if (!res.ok) throw new Error(`GitHub said ${res.status}.`);
+async function dbPull() {
+  const res = await fetch(`${dbUrl()}?t=${Date.now()}`, { cache: "no-store" });
+  if (res.status === 401 || res.status === 403) throw new Error("Database is locked — set its rules to allow reads and writes.");
+  if (!res.ok) throw new Error(`Database returned ${res.status}.`);
   const j = await res.json();
-  return { data: JSON.parse(b64decode(j.content)), sha: j.sha };
+  return j || null;
 }
 
-async function ghPush(cfg, payload, sha) {
-  const res = await ghRequest(cfg, "PUT", {
-    message: `putting yard sync ${new Date().toISOString()}`,
-    content: b64encode(JSON.stringify(payload)),
-    branch: cfg.branch || "main",
-    ...(sha ? { sha } : {}),
+async function dbPush(payload) {
+  const res = await fetch(dbUrl(), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   });
-  if (res.status === 409) throw new Error("Someone else synced first — try again.");
-  if (!res.ok) throw new Error(`Push failed (${res.status}).`);
-  return res.json();
+  if (res.status === 401 || res.status === 403) throw new Error("Database is locked — set its rules to allow reads and writes.");
+  if (!res.ok) throw new Error(`Save failed (${res.status}).`);
+  return true;
 }
 
 // haptics: Android Chrome buzzes; iOS Safari ignores this silently
@@ -450,10 +449,139 @@ function Icon({ name, size = 15, style }) {
     cloud: <><path d="M7 18h10a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.6 1.3A3.6 3.6 0 0 0 7 18z" /></>,
     save: <><path d="M12 3v11" /><path d="M8 11l4 4 4-4" /><path d="M4 19h16" /></>,
     ruler: <><path d="M3 9h18v6H3z" /><path d="M7 9v3M11 9v4M15 9v3M19 9v4" /></>,
+    pencil: <><path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17z" /><path d="M14.5 6.5l3 3" /></>,
+    trash: <><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6.5 7l1 13h9l1-13" /></>,
     person: <><circle cx="12" cy="8" r="3.4" /><path d="M5 20a7 7 0 0 1 14 0" /></>,
     spark: <><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M18 6l-2 2M8 16l-2 2" /><circle cx="12" cy="12" r="3" /></>,
   };
   return <svg {...common} aria-hidden="true">{paths[name] || paths.disc}</svg>;
+}
+
+// Flags and watch status are derived from the sequence of makes, so after any
+// edit the entire chain is replayed from flag 1 rather than patched in place.
+function replaySession(rounds) {
+  let flag = 1, watch = false;
+  return rounds.map(r => {
+    const made = roundOrder(r).reduce((n, k) => n + (r.results[k] ? 1 : 0), 0);
+    const out = { ...r, flag, made, prevFlag: flag, prevWatch: watch };
+    const { nf, nw } = applyRules(flag, watch, made);
+    flag = nf; watch = nw;
+    return out;
+  });
+}
+
+// ---------- miss directions ----------
+// Stored alongside (not instead of) the boolean make/miss, so every existing
+// stat keeps working and direction is purely additive.
+const DIRS = [
+  { k: "L",  label: "Left",  arrow: "\u2190", area: "1 / 1 / 2 / 2" },
+  { k: "H",  label: "High",  arrow: "\u2191", area: "1 / 2 / 2 / 3" },
+  { k: "Lo", label: "Low",   arrow: "\u2193", area: "2 / 1 / 3 / 2" },
+  { k: "R",  label: "Right", arrow: "\u2192", area: "2 / 2 / 3 / 3" },
+];
+const DIR_LABEL = { L: "left", R: "right", H: "high", Lo: "low" };
+
+// One putt: a big MADE target, plus a compact four-way pad for where it missed.
+// The pad reads as one unit, so it never competes with MADE for attention.
+function PuttRow({ label, sub, tint, value, dir, onMade, onMiss }) {
+  const missed = value === false;
+  return (
+    <div className="flex-1 flex gap-2 min-h-0">
+      <div className="flex flex-col items-center justify-center rounded-2xl"
+        style={{ width: 50, background: tint || "#EDEAE0", color: tint ? "#fff" : C.faint }}>
+        <span style={{ ...disp, fontWeight: 800, fontSize: 17, letterSpacing: "0.04em" }}>{label}</span>
+        {sub && <span style={{ fontSize: 10, opacity: 0.85 }}>{sub}</span>}
+      </div>
+
+      <button onClick={onMade} className="rounded-2xl"
+        style={{
+          flex: "1.35 1 0%",
+          background: value === true ? C.fairway : C.card,
+          color: value === true ? "#fff" : C.ink,
+          border: value === true ? `2px solid ${C.fairway}` : `2px solid ${C.line}`,
+          ...disp, fontWeight: 800, fontSize: 25,
+        }}>MADE</button>
+
+      <div className="rounded-2xl"
+        style={{
+          flex: "1 1 0%", display: "grid",
+          gridTemplateColumns: "1fr 1fr", gridTemplateRows: "1fr 1fr", gap: 3, padding: 3,
+          background: missed ? C.miss : C.card,
+          border: `2px solid ${missed ? C.miss : C.line}`,
+        }}>
+        {DIRS.map(d => {
+          const on = missed && dir === d.k;
+          return (
+            <button key={d.k} onClick={() => onMiss(d.k)} aria-label={`Missed ${d.label.toLowerCase()}`}
+              style={{
+                gridArea: d.area, borderRadius: 11,
+                background: on ? "#fff" : missed ? "rgba(255,255,255,0.18)" : "#FAF8F2",
+                color: on ? C.ink : missed ? "#fff" : C.faint,
+                ...disp, fontWeight: 800, fontSize: 19, lineHeight: 1,
+              }}>
+              {d.arrow}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- flight path ----------
+// The ladder drawn as a disc flight: a hyzer arc from the tee up to the basket,
+// with the five flags spaced along it and the disc parked on your current one.
+function FlightPath({ flag, watch, highest = 1 }) {
+  const W = 320, H = 112;
+  // Basket sits at the tee end; the line climbs away from it, so "farther out"
+  // reads as higher and further right. Control point gives it a disc's arc.
+  const p0 = { x: 58, y: H - 34 }, p1 = { x: 205, y: H - 30 }, p2 = { x: W - 22, y: 22 };
+  const at = (t) => ({
+    x: (1 - t) ** 2 * p0.x + 2 * (1 - t) * t * p1.x + t ** 2 * p2.x,
+    y: (1 - t) ** 2 * p0.y + 2 * (1 - t) * t * p1.y + t ** 2 * p2.y,
+  });
+  const stops = [1, 2, 3, 4, 5].map(f => ({ f, ...at((f - 1) / 4) }));
+  const disc = stops[flag - 1];
+  const accent = watch ? C.amber : C.fairway;
+  const path = `M${p0.x} ${p0.y} Q${p1.x} ${p1.y} ${p2.x} ${p2.y}`;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} style={{ display: "block" }} aria-hidden="true">
+      {/* basket at the near end */}
+      <g transform={`translate(${p0.x - 46} ${p0.y - 20})`} stroke={C.line} strokeWidth="1.6" fill="none" strokeLinecap="round">
+        <path d="M9 0v22" /><path d="M3 6h12" /><path d="M5 6l4 5 4-5" /><path d="M4 14h10l-1.5 3h-7z" />
+      </g>
+
+      {/* the run ahead, faint */}
+      <path d={path} fill="none" stroke={C.line} strokeWidth="2" strokeDasharray="2.5 5" strokeLinecap="round" />
+      {/* the ground you've covered */}
+      <path d={path} fill="none" stroke={accent} strokeWidth="2.5" strokeLinecap="round"
+        pathLength="100" strokeDasharray="100"
+        strokeDashoffset={100 - ((flag - 1) / 4) * 100}
+        style={{ transition: "stroke-dashoffset 520ms cubic-bezier(.22,.9,.3,1), stroke 300ms" }} />
+
+      {stops.map(s => {
+        const reached = highest >= s.f, cur = s.f === flag;
+        return (
+          <g key={s.f} transform={`translate(${s.x} ${s.y})`}>
+            <line x1="0" y1="1" x2="0" y2="13" stroke={cur ? C.ink : reached ? "#B9C6BC" : C.line} strokeWidth="1.7" strokeLinecap="round" />
+            <path d="M0.5 1.5 L10 4.8 L0.5 8 Z"
+              fill={cur ? accent : reached ? "#CFE3D6" : "#ECE9DF"}
+              stroke={cur ? C.ink : C.line} strokeWidth="0.9" strokeLinejoin="round" />
+            <text x="0" y="23" textAnchor="middle"
+              style={{ ...disp, fontWeight: 700, fontSize: 12, fill: cur ? C.ink : C.faint }}>{s.f}</text>
+          </g>
+        );
+      })}
+
+      {/* the disc, hovering over the flag you're on */}
+      <g style={{ transition: "transform 520ms cubic-bezier(.22,.9,.3,1)" }}
+        transform={`translate(${disc.x} ${disc.y - 13})`}>
+        <ellipse rx="9.5" ry="4" fill={accent} stroke={C.ink} strokeWidth="1.1" />
+        <ellipse rx="4.2" ry="1.5" fill="none" stroke={C.paper} strokeWidth="1" opacity="0.85" />
+      </g>
+    </svg>
+  );
 }
 
 // ---------- small pieces ----------
@@ -527,6 +655,37 @@ function StatsBody({ segments, distances = {} }) {
           </div>
         ))}
       </StatBlock>
+
+      {(() => {
+        const m = s.missDirs, known = m.L + m.R + m.H + m.Lo;
+        if (!known) return null;
+        const cell = (k, label) => {
+          const n = m[k], p = Math.round((100 * n) / known);
+          return (
+            <div key={k} className="rounded-xl py-2 text-center"
+              style={{ background: n ? `rgba(46,107,69,${0.08 + 0.5 * (n / known)})` : "#FAF8F2", border: `1px solid ${C.line}` }}>
+              <div style={{ ...disp, fontWeight: 800, fontSize: 20, lineHeight: 1 }}>{p}%</div>
+              <div style={{ fontSize: 11, color: C.faint }}>{label}</div>
+            </div>
+          );
+        };
+        const worst = ["L", "R", "H", "Lo"].reduce((a, b) => (m[b] > m[a] ? b : a), "L");
+        return (
+          <StatBlock title="Where the misses go" icon="target">
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
+              <div />{cell("H", "high")}<div />
+              {cell("L", "left")}
+              <div className="flex items-center justify-center" style={{ color: C.line }}><Icon name="basket" size={26} /></div>
+              {cell("R", "right")}
+              <div />{cell("Lo", "low")}<div />
+            </div>
+            <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
+              {known} logged miss{known > 1 ? "es" : ""} — most often {DIR_LABEL[worst]}.
+              {m.unknown ? ` ${m.unknown} without a direction.` : ""}
+            </div>
+          </StatBlock>
+        );
+      })()}
 
       <StatBlock title="Rounds to advance" icon="climb">
         <div className="flex gap-2">
@@ -735,7 +894,9 @@ export default function App() {
   const [sessions, setSessions] = useState([]);
   const [active, setActive] = useState(null); // {startedAt, flag, watch, rounds, order, anchor}
   const [pending, setPending] = useState({ orange: null, red: null, green: null });
-  const [gamePending, setGamePending] = useState({ orange: null, red: null, green: null });
+  const [pendingDir, setPendingDir] = useState({});
+  const [gamePending, setGamePending] = useState([null, null, null]);
+  const [gameDir, setGameDir] = useState({});
   const [playerName, setPlayerName] = useState("Me");
   const [updateReady, setUpdateReady] = useState(false);
   const [banner, setBanner] = useState(null);
@@ -749,7 +910,9 @@ export default function App() {
   const [gameIdx, setGameIdx] = useState(null);
   const [confirmQuit, setConfirmQuit] = useState(false);
   const committing = useRef(false);
+  const missDirRef = useRef({});
   const gameCommitting = useRef(false);
+  const gameDirRef = useRef({});
   const wakeLock = useRef(null);
 
   useEffect(() => {
@@ -761,9 +924,7 @@ export default function App() {
       const ga = await loadKey("dg-game-active");
       const pn = await loadKey("dg-player");
       if (pn) setPlayerName(pn);
-      const cfg = await loadKey("dg-gh");
       const ls = await loadKey("dg-lastsync");
-      if (cfg) setGh(cfg);
       if (ls) setLastSync(ls);
       // ask the browser not to evict our data
       try { if (navigator.storage?.persist) await navigator.storage.persist(); } catch { /* not supported */ }
@@ -811,56 +972,42 @@ export default function App() {
   };
 
   const fileRef = useRef(null);
-  const [gh, setGh] = useState(null);            // {owner, repo, token, path, branch}
-  const [ghForm, setGhForm] = useState({ owner: "", repo: "", token: "" });
+  // always-current snapshot of local data for async callbacks
+  const dataRef = useRef({ sessions: [], games: [], distances: {} });
+  dataRef.current = { sessions, games, distances };
+
   const [syncMsg, setSyncMsg] = useState("");
   const [syncing, setSyncing] = useState(false);
   const [lastSync, setLastSync] = useState(null);
-  const [showSync, setShowSync] = useState(false);
 
-  const saveGh = (cfg) => { setGh(cfg); saveKey("dg-gh", cfg); };
-
-  // pull remote, merge with local, push the union back
-  const syncNow = async (cfg = gh, quiet = false) => {
-    if (!cfg || syncing) return;
+  // pull the shared data, merge with what's on this device, push the union back.
+  // Local values come from a ref, never the closure: a sync fired moments after
+  // saving a session would otherwise merge against the pre-save list and lose it.
+  const syncNow = async (quiet = false) => {
+    if (!dbConfigured() || syncing) return;
     setSyncing(true);
     if (!quiet) setSyncMsg("Syncing…");
     try {
-      const { data, sha } = await ghPull(cfg);
-      let ns = sessions, ngm = games, nd = distances;
+      const data = await dbPull();
+      const local = dataRef.current;
+      let ns = local.sessions, ngm = local.games, nd = local.distances;
       if (data) {
         const remote = unpackAll(data);
-        ns = mergeRecords(sessions, remote.sessions, x => x.rounds.length);
-        ngm = mergeRecords(games, remote.games, x => (x.rounds || x.shots || []).length);
-        nd = { ...remote.distances, ...distances };
+        ns = mergeRecords(local.sessions, remote.sessions, x => x.rounds.length);
+        ngm = mergeRecords(local.games, remote.games, x => (x.rounds || x.shots || []).length);
+        nd = { ...remote.distances, ...local.distances };
         setSessions(ns); setGames(ngm); setDistances(nd);
         saveKey("dg-sessions", ns); saveKey("dg-games", ngm); saveKey("dg-flags", nd);
       }
-      await ghPush(cfg, packAll(ns, ngm, nd), sha);
+      await dbPush(packAll(ns, ngm, nd));
       const now = Date.now();
       setLastSync(now); saveKey("dg-lastsync", now);
-      setSyncMsg(`Synced — ${ns.length} sessions, ${ngm.length} games.`);
+      setSyncMsg(`Synced — ${ns.length} sessions, ${ngm.length} runs.`);
     } catch (e) {
-      setSyncMsg(e.message || "Sync failed.");
+      setSyncMsg(e.message || "Sync failed — will retry next time.");
     }
     setSyncing(false);
     setTimeout(() => setSyncMsg(""), 6000);
-  };
-
-  const connectGh = async () => {
-    const cfg = {
-      owner: ghForm.owner.trim(), repo: ghForm.repo.trim(),
-      token: ghForm.token.trim(), path: "putting-data.json", branch: "main",
-    };
-    if (!cfg.owner || !cfg.repo || !cfg.token) { setSyncMsg("Fill in all three fields."); return; }
-    saveGh(cfg);
-    setGhForm({ ...ghForm, token: "" });
-    await syncNow(cfg);
-  };
-
-  const disconnectGh = () => {
-    setGh(null); deleteKey("dg-gh"); setSyncMsg("Disconnected. Data stays on this device.");
-    setTimeout(() => setSyncMsg(""), 5000);
   };
 
   const [backupMsg, setBackupMsg] = useState("");
@@ -906,10 +1053,10 @@ export default function App() {
   // browser picks the history back up on its own
   const pulledOnce = useRef(false);
   useEffect(() => {
-    if (!loaded || !gh || pulledOnce.current) return;
+    if (!loaded || !dbConfigured() || pulledOnce.current) return;
     pulledOnce.current = true;
-    syncNow(gh, true);
-  }, [loaded, gh]);
+    syncNow(true);
+  }, [loaded]);
 
   // last-chance save if the app is backgrounded or closed mid-round
   const liveRef = useRef({ active: null, pending: null, game: null });
@@ -969,10 +1116,12 @@ export default function App() {
     });
   };
 
-  const answer = (key, made) => {
+  const answer = (key, made, dir = null) => {
     if (committing.current) return;
     const p = { ...pending, [key]: made };
-    setPending(p);
+    const pd = { ...pendingDir };
+    if (made) delete pd[key]; else pd[key] = dir;
+    setPending(p); setPendingDir(pd); missDirRef.current = pd;
     const complete = DEFAULT_ORDER.every(k => p[k] !== null);
     if (complete) {
       committing.current = true;
@@ -994,7 +1143,7 @@ export default function App() {
       const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
       const dur = Math.max(0, (now - (prev.anchor || prev.startedAt)) / 1000);
       const round = {
-        flag: prev.flag, results: { ...p }, made,
+        flag: prev.flag, results: { ...p }, miss: { ...missDirRef.current }, made,
         prevFlag: prev.flag, prevWatch: prev.watch,
         order: [...(prev.order || DEFAULT_ORDER)], dur, t: now,
       };
@@ -1004,6 +1153,7 @@ export default function App() {
       return next;
     });
     setPending({ orange: null, red: null, green: null });
+    setPendingDir({}); missDirRef.current = {};
     committing.current = false;
   };
 
@@ -1025,25 +1175,26 @@ export default function App() {
     const list = [...sessions, done];
     setSessions(list); setActive(null); setDetailIdx(list.length - 1);
     saveKey("dg-sessions", list); deleteKey("dg-active");
-    if (gh) setTimeout(() => syncNow(gh, true), 400);
+    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
     setConfirmDelete(false);
     setView("detail");
   };
 
   const startGame = () => {
     const g = { startedAt: Date.now(), flag: 1, watch: false, rounds: [], name: playerName || "Me", pending: null };
-    setGame(g); setGamePending({ orange: null, red: null, green: null });
+    setGame(g); setGamePending([null, null, null]); setGameDir({});
     setBanner(null); setConfirmQuit(false); setView("game");
     saveKey("dg-game-active", g);
   };
 
   const resumeGame = () => {
-    let restored = { orange: null, red: null, green: null };
+    let restored = [null, null, null], restoredDir = {};
     setGame(prev => {
-      restored = prev.pending || restored;
+      if (Array.isArray(prev.pending)) restored = prev.pending;
+      restoredDir = prev.pendingDir || {};
       return prev;
     });
-    setGamePending(restored);
+    setGamePending(restored); setGameDir(restoredDir);
     setBanner(null); setConfirmQuit(false); setView("game");
   };
 
@@ -1055,29 +1206,31 @@ export default function App() {
     const list = [...games, done];
     setGames(list); setGame(null); setGameIdx(list.length - 1);
     saveKey("dg-games", list); deleteKey("dg-game-active");
-    if (gh) setTimeout(() => syncNow(gh, true), 400);
+    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
     setConfirmDelete(false);
     setView("gamedetail");
   };
 
-  const gameAnswer = (key, made) => {
+  const gameAnswer = (i, made, dir = null) => {
     if (gameCommitting.current) return;
-    const p = { ...gamePending, [key]: made };
-    setGamePending(p);
-    if (DEFAULT_ORDER.every(k => p[k] !== null)) {
+    const p = [...gamePending]; p[i] = made;
+    const pd = { ...gameDir };
+    if (made) delete pd[i]; else pd[i] = dir;
+    setGamePending(p); setGameDir(pd); gameDirRef.current = pd;
+    if (p.every(v => v !== null)) {
       gameCommitting.current = true;
       setTimeout(() => commitGameRound(p), 350);
     } else {
-      setGame(prev => { const next = { ...prev, pending: p }; saveKey("dg-game-active", next); return next; });
+      setGame(prev => { const next = { ...prev, pending: p, pendingDir: pd }; saveKey("dg-game-active", next); return next; });
     }
   };
 
   const commitGameRound = (p) => {
     setGame(prev => {
-      const made = DEFAULT_ORDER.reduce((n, k) => n + (p[k] ? 1 : 0), 0);
+      const made = p.reduce((n, v) => n + (v ? 1 : 0), 0);
       const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
       const pts = made * flagPts(prev.flag);
-      const round = { flag: prev.flag, made, prevFlag: prev.flag, prevWatch: prev.watch };
+      const round = { flag: prev.flag, made, putts: [...p], miss: { ...gameDirRef.current }, prevFlag: prev.flag, prevWatch: prev.watch };
       const next = { ...prev, flag: nf, watch: nw, rounds: [...prev.rounds, round], pending: null };
       queueMicrotask(() => {
         setBanner(`${made}/3 at flag ${prev.flag} — +${pts} pts · ${msg.replace(/^\d\/3 — /, "")}`);
@@ -1087,7 +1240,8 @@ export default function App() {
       });
       return next;
     });
-    setGamePending({ orange: null, red: null, green: null });
+    setGamePending([null, null, null]);
+    setGameDir({}); gameDirRef.current = {};
     gameCommitting.current = false;
   };
 
@@ -1095,7 +1249,7 @@ export default function App() {
     if (!game || game.rounds.length === 0) return;
     const last = game.rounds[game.rounds.length - 1];
     const next = { ...game, flag: last.prevFlag, watch: last.prevWatch, rounds: game.rounds.slice(0, -1), pending: null };
-    setGame(next); setGamePending({ orange: null, red: null, green: null });
+    setGame(next); setGamePending([null, null, null]); setGameDir({});
     setBanner(`Undid round ${game.rounds.length}`);
     saveKey("dg-game-active", next);
   };
@@ -1110,6 +1264,40 @@ export default function App() {
     saveKey("dg-games", list);
     setConfirmDelete(false);
     setView("home");
+  };
+
+  const [editing, setEditing] = useState(false);
+
+  const writeSessions = (list) => {
+    setSessions(list);
+    saveKey("dg-sessions", list);
+    if (dbConfigured()) setTimeout(() => syncNow(true), 400);
+  };
+
+  const togglePutt = (sIdx, rIdx, disc) => {
+    const list = sessions.map((s, i) => {
+      if (i !== sIdx) return s;
+      const rounds = s.rounds.map((r, j) => {
+        if (j !== rIdx) return r;
+        const results = { ...r.results, [disc]: !r.results[disc] };
+        const miss = { ...(r.miss || {}) };
+        if (results[disc]) delete miss[disc];
+        return { ...r, results, miss };
+      });
+      return { ...s, rounds: replaySession(rounds) };
+    });
+    writeSessions(list);
+  };
+
+  const deleteRound = (sIdx, rIdx) => {
+    const list = sessions.map((s, i) => {
+      if (i !== sIdx) return s;
+      const rounds = s.rounds.filter((_, j) => j !== rIdx);
+      return { ...s, rounds: replaySession(rounds) };
+    });
+    // a session with no rounds left is just removed
+    writeSessions(list.filter(s => s.rounds.length > 0));
+    if (list[sIdx].rounds.length === 0) { setEditing(false); setView("home"); }
   };
 
   const deleteSession = (idx) => {
@@ -1166,7 +1354,7 @@ export default function App() {
         </div>
 
         {/* flag rail + current flag */}
-        <FlagRail flag={active.flag} watch={active.watch} highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)} />
+        <FlightPath flag={active.flag} watch={active.watch} highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 38, lineHeight: 1 }}>FLAG {active.flag}</span>
           {ft(active.flag) && <span style={{ ...disp, fontWeight: 700, fontSize: 20, color: C.faint }} className="ml-2">{ft(active.flag)}</span>}
@@ -1174,37 +1362,40 @@ export default function App() {
 
         {/* banner */}
         <div className="rounded-xl px-3 py-2 text-center mb-2" style={{ background: banner ? C.ink : "#EDEAE0", color: banner ? "#fff" : C.faint, ...disp, fontWeight: 700, fontSize: 17, minHeight: 38 }}>
-          {banner || `Rows are throw order — tap a color to throw it first (${answered}/3)`}
+          {banner || `Tap MADE, or the arrow for where it missed (${answered}/3)`}
         </div>
 
-        {/* disc rows in throw order */}
+        {/* one row per putter, in throw order */}
         <div className="flex-1 flex flex-col gap-2 min-h-0">
-          {order.map((k, i) => {
-            const v = pending[k];
-            return (
-              <div key={k} className="flex-1 flex gap-2 min-h-0">
-                <button onClick={() => throwFirst(k)} className="relative flex flex-col items-center justify-center rounded-2xl" style={{ width: 64, background: DISC[k].color }}>
-                  <span className="absolute top-1 left-2 rounded-full" style={{ ...disp, fontWeight: 800, fontSize: 13, color: "rgba(255,255,255,0.85)" }}>{i + 1}</span>
-                  <span style={{ ...disp, fontWeight: 800, fontSize: 15, color: "#fff", letterSpacing: "0.04em" }}>{DISC[k].label}</span>
-                </button>
-                <button onClick={() => answer(k, true)} className="flex-1 rounded-2xl"
-                  style={{
-                    background: v === true ? C.fairway : C.card,
-                    color: v === true ? "#fff" : C.ink,
-                    border: v === true ? `2px solid ${C.fairway}` : `2px solid ${C.line}`,
-                    ...disp, fontWeight: 800, fontSize: 26,
-                  }}>MADE</button>
-                <button onClick={() => answer(k, false)} className="flex-1 rounded-2xl"
-                  style={{
-                    background: v === false ? C.miss : C.card,
-                    color: v === false ? "#fff" : C.faint,
-                    border: v === false ? `2px solid ${C.miss}` : `2px solid ${C.line}`,
-                    ...disp, fontWeight: 800, fontSize: 26,
-                  }}>MISS</button>
-              </div>
-            );
-          })}
+          {order.map((k, i) => (
+            <PuttRow
+              key={k}
+              label={DISC[k].label}
+              sub={`#${i + 1}`}
+              tint={DISC[k].color}
+              value={pending[k]}
+              dir={pendingDir[k]}
+              onMade={() => answer(k, true)}
+              onMiss={(d) => answer(k, false, d)}
+            />
+          ))}
         </div>
+
+        {/* reorder: only shown before the round starts, so it never gets in the way */}
+        {answered === 0 && (
+          <div className="flex items-center gap-1.5 mt-2">
+            <span style={{ fontSize: 11, color: C.faint }}>Throw first:</span>
+            {DEFAULT_ORDER.map(k => (
+              <button key={k} onClick={() => throwFirst(k)} className="rounded-full px-2.5 py-1"
+                style={{
+                  background: order[0] === k ? DISC[k].color : "transparent",
+                  color: order[0] === k ? "#fff" : C.faint,
+                  border: `1.5px solid ${order[0] === k ? DISC[k].color : C.line}`,
+                  ...disp, fontWeight: 700, fontSize: 13,
+                }}>{DISC[k].label}</button>
+            ))}
+          </div>
+        )}
 
         {/* undo */}
         <button onClick={undo} disabled={active.rounds.length === 0} className="mt-2 rounded-2xl py-3 w-full"
@@ -1219,7 +1410,7 @@ export default function App() {
   if (view === "game" && game) {
     const score = gameScore(game);
     const roundNum = game.rounds.length + 1;
-    const answered = DEFAULT_ORDER.filter(k => gamePending[k] !== null).length;
+    const answered = gamePending.filter(v => v !== null).length;
     return shell(
       <div className="flex flex-col px-3 pt-3 pb-3" style={{ height: "100dvh" }}>
         {/* header */}
@@ -1241,7 +1432,7 @@ export default function App() {
         </div>
 
         {/* flag rail */}
-        <FlagRail flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} />
+        <FlightPath flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 34, lineHeight: 1 }}>FLAG {game.flag}</span>
           <span style={{ ...disp, fontWeight: 700, fontSize: 19, color: C.fairway }} className="ml-2">
@@ -1252,35 +1443,23 @@ export default function App() {
 
         {/* banner */}
         <div className="rounded-xl px-3 py-2 text-center mb-2" style={{ background: banner ? C.ink : "#EDEAE0", color: banner ? "#fff" : C.faint, ...disp, fontWeight: 700, fontSize: 17, minHeight: 38 }}>
-          {banner || `Log all three putters (${answered}/3)`}
+          {banner || `Log all three putts (${answered}/3)`}
         </div>
 
-        {/* three putters */}
+        {/* three putts — no colors here, just the throws */}
         <div className="flex-1 flex flex-col gap-2 min-h-0">
-          {DEFAULT_ORDER.map(k => {
-            const v = gamePending[k];
-            return (
-              <div key={k} className="flex-1 flex gap-2 min-h-0">
-                <div className="flex flex-col items-center justify-center rounded-2xl" style={{ width: 58, background: DISC[k].color }}>
-                  <span style={{ ...disp, fontWeight: 800, fontSize: 15, color: "#fff", letterSpacing: "0.04em" }}>{DISC[k].label}</span>
-                </div>
-                <button onClick={() => gameAnswer(k, true)} className="flex-1 rounded-2xl"
-                  style={{
-                    background: v === true ? C.fairway : C.card,
-                    color: v === true ? "#fff" : C.ink,
-                    border: v === true ? `2px solid ${C.fairway}` : `2px solid ${C.line}`,
-                    ...disp, fontWeight: 800, fontSize: 26,
-                  }}>MADE</button>
-                <button onClick={() => gameAnswer(k, false)} className="flex-1 rounded-2xl"
-                  style={{
-                    background: v === false ? C.miss : C.card,
-                    color: v === false ? "#fff" : C.faint,
-                    border: v === false ? `2px solid ${C.miss}` : `2px solid ${C.line}`,
-                    ...disp, fontWeight: 800, fontSize: 26,
-                  }}>MISS</button>
-              </div>
-            );
-          })}
+          {[0, 1, 2].map(i => (
+            <PuttRow
+              key={i}
+              label={`${i + 1}`}
+              sub="putt"
+              tint={null}
+              value={gamePending[i] ?? null}
+              dir={gameDir[i]}
+              onMade={() => gameAnswer(i, true)}
+              onMiss={(d) => gameAnswer(i, false, d)}
+            />
+          ))}
         </div>
 
         {/* undo */}
@@ -1395,7 +1574,47 @@ export default function App() {
             </div>
           ) : <div className="mb-2" />;
         })()}
-        <StatBlock title="Progression" icon="route"><Progression rounds={s.rounds} /></StatBlock>
+        <StatBlock title="Progression" icon="route">
+          <Progression rounds={s.rounds} />
+          <button onClick={() => setEditing(e => !e)} className="w-full rounded-xl py-2 mt-3 flex items-center justify-center gap-1.5"
+            style={{ border: `1.5px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 15 }}>
+            <Icon name="pencil" size={13} />{editing ? "Done editing" : "Edit rounds"}
+          </button>
+        </StatBlock>
+
+        {editing && (
+          <StatBlock title="Edit rounds" icon="pencil">
+            <div style={{ fontSize: 12, color: C.faint, lineHeight: 1.5 }} className="mb-2">
+              Tap a putt to flip it between made and missed. Flags and watch status are recalculated down the whole session.
+            </div>
+            {s.rounds.map((r, ri) => (
+              <div key={ri} className="flex items-center gap-2 py-1.5" style={{ borderTop: ri ? `1px solid ${C.line}` : "none" }}>
+                <span style={{ ...disp, fontWeight: 700, fontSize: 15, width: 46, color: C.faint }}>F{r.flag}</span>
+                <div className="flex gap-1.5 flex-1">
+                  {roundOrder(r).map(k => {
+                    const hit = !!r.results[k];
+                    return (
+                      <button key={k} onClick={() => togglePutt(detailIdx, ri, k)}
+                        className="flex-1 rounded-lg py-2"
+                        style={{
+                          background: hit ? C.fairway : "#FAF8F2",
+                          color: hit ? "#fff" : C.faint,
+                          border: `1.5px solid ${hit ? C.fairway : C.line}`,
+                          ...disp, fontWeight: 700, fontSize: 14,
+                        }}>
+                        {hit ? "made" : (r.miss?.[k] ? DIR_LABEL[r.miss[k]] : "miss")}
+                      </button>
+                    );
+                  })}
+                </div>
+                <button onClick={() => deleteRound(detailIdx, ri)} aria-label="Delete round"
+                  style={{ color: C.faint, padding: "6px 4px" }}>
+                  <Icon name="trash" size={15} />
+                </button>
+              </div>
+            ))}
+          </StatBlock>
+        )}
         <StatsBody segments={[s.rounds]} distances={distances} />
         <button onClick={startSession} className="w-full rounded-2xl py-4 mt-1" style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>Start new session</button>
         {!confirmDelete ? (
@@ -1533,64 +1752,28 @@ export default function App() {
           <div className="flex items-center gap-1.5" style={{ color: C.faint }}>
             <Icon name="cloud" size={14} />
             <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>
-              Cloud sync {gh ? "· on" : "· off"}
+              Shared data {dbConfigured() ? "· on" : "· off"}
             </span>
           </div>
-          {gh && (
-            <button onClick={() => syncNow()} disabled={syncing} className="rounded-full px-3 py-1"
+          {dbConfigured() && (
+            <button onClick={() => syncNow(false)} disabled={syncing} className="rounded-full px-3 py-1"
               style={{ border: `1.5px solid ${C.line}`, color: syncing ? C.line : C.ink, fontSize: 13, fontWeight: 600 }}>
               {syncing ? "Syncing…" : "Sync now"}
             </button>
           )}
         </div>
 
-        {gh ? (
-          <>
-            <div style={{ fontSize: 13 }}>
-              Saving to <strong>{gh.owner}/{gh.repo}</strong> → {gh.path}
-            </div>
-            <div style={{ fontSize: 12, color: C.faint }} className="mt-1">
-              {syncMsg || (lastSync ? `Last synced ${fmtDate(lastSync)}. Syncs automatically when a session or game ends.` : "Not synced yet.")}
-            </div>
-            <button onClick={disconnectGh} className="w-full rounded-xl py-2 mt-3"
-              style={{ border: `1.5px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 15 }}>
-              Disconnect
-            </button>
-          </>
-        ) : !showSync ? (
-          <>
-            <div style={{ fontSize: 13, color: C.faint, lineHeight: 1.5 }}>
-              Keep your history in a GitHub repo so it survives a wiped browser or a new phone.
-            </div>
-            <button onClick={() => setShowSync(true)} className="w-full rounded-xl py-3 mt-3"
-              style={{ border: `2px solid ${C.line}`, color: C.ink, ...disp, fontWeight: 700, fontSize: 16 }}>
-              Set up cloud sync
-            </button>
-          </>
+        {dbConfigured() ? (
+          <div style={{ fontSize: 12, color: syncMsg && !syncMsg.startsWith("Synced") && !syncMsg.startsWith("Syncing") ? C.amber : C.faint, lineHeight: 1.5 }}>
+            {syncMsg || (lastSync
+              ? `Last synced ${fmtDate(lastSync)}. Every device using this app reads and writes the same data — nothing to log into.`
+              : "Connected. Syncing when a session or run finishes.")}
+          </div>
         ) : (
-          <>
-            <div className="flex flex-col gap-2">
-              <input value={ghForm.owner} onChange={e => setGhForm({ ...ghForm, owner: e.target.value })}
-                placeholder="GitHub username" autoCapitalize="none" autoCorrect="off"
-                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
-              <input value={ghForm.repo} onChange={e => setGhForm({ ...ghForm, repo: e.target.value })}
-                placeholder="Repo name (e.g. putting-data)" autoCapitalize="none" autoCorrect="off"
-                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
-              <input value={ghForm.token} onChange={e => setGhForm({ ...ghForm, token: e.target.value })}
-                placeholder="Fine-grained token (github_pat_…)" type="password" autoCapitalize="none" autoCorrect="off"
-                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
-            </div>
-            <button onClick={connectGh} disabled={syncing} className="w-full rounded-xl py-3 mt-2"
-              style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 700, fontSize: 17 }}>
-              {syncing ? "Connecting…" : "Connect and sync"}
-            </button>
-            <div style={{ fontSize: 12, color: syncMsg.includes("Synced") ? C.fairway : C.amber }} className="mt-2">
-              {syncMsg}
-            </div>
-            <div style={{ fontSize: 12, color: C.faint, lineHeight: 1.5 }} className="mt-2">
-              Use a <strong>private</strong> repo and a fine-grained token limited to just that repo, with Contents set to Read and write. The token is stored on this device only — never committed.
-            </div>
-          </>
+          <div style={{ fontSize: 13, color: C.faint, lineHeight: 1.5 }}>
+            Not set up. Put your database URL in <strong>config.js</strong> and redeploy, and every device will share one set of
+            sessions and runs automatically — no accounts, no tokens. Setup notes are in that file.
+          </div>
         )}
       </div>
 
@@ -1612,8 +1795,8 @@ export default function App() {
         <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
           onChange={e => { const f = e.target.files?.[0]; if (f) importData(f); e.target.value = ""; }} />
         <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
-          {backupMsg || (gh
-            ? "Synced to GitHub. A backup file is still handy if you ever want a copy you control outright."
+          {backupMsg || (dbConfigured()
+            ? "Synced to your shared database. A backup file is still worth keeping now and then."
             : "Your data lives on this device only. Save a backup file now and then, or to move to a new phone.")}
         </div>
       </div>
