@@ -22,7 +22,11 @@ const DISC = {
   green: { label: "GRN", color: C.green },
 };
 const DEFAULT_ORDER = ["orange", "red", "green"];
+// Bump this every release. It's shown at the bottom of the home screen so you
+// can tell at a glance whether your phone picked up a new deploy.
+const BUILD = "v5 · icons + scored runs";
 const disp = { fontFamily: "'Barlow Condensed', sans-serif" };
+
 const body = { fontFamily: "'Barlow', sans-serif" };
 
 // ---------- round rules ----------
@@ -176,16 +180,52 @@ const aggAcc = segments => {
   return { m, a };
 };
 
-// ---------- 30-shot game ----------
-const GAME_SHOTS = 30;
+// ---------- scored ladder run (leaderboard game) ----------
+// Same 3-putter rounds and same progression rules as a normal session.
+// The only difference: every make scores the flag number you threw it from,
+// the run is a fixed 10 rounds, and the total lands on a leaderboard.
+const GAME_ROUNDS = 10;
+const GAME_SHOTS = GAME_ROUNDS * 3;
 const flagPts = f => f; // flag number = points per make
-const gameScore = shots => shots.reduce((n, s) => n + (s.made ? flagPts(s.flag) : 0), 0);
-function gameFlagTable(shots) {
+// Best possible: you can only reach flag 5 by round 5, so 3*(1+2+3+4+5+5+5+5+5+5).
+const GAME_MAX = 120;
+
+// New runs store `rounds`; older free-shot runs stored `shots`. Both still score.
+const gameScore = (g) => {
+  if (Array.isArray(g?.rounds)) return g.rounds.reduce((n, r) => n + r.made * flagPts(r.flag), 0);
+  const shots = Array.isArray(g) ? g : (g?.shots || []);
+  return shots.reduce((n, s) => n + (s.made ? flagPts(s.flag) : 0), 0);
+};
+const gameMakes = (g) => Array.isArray(g?.rounds)
+  ? g.rounds.reduce((n, r) => n + r.made, 0)
+  : (g?.shots || []).filter(s => s.made).length;
+const gameAttempts = (g) => Array.isArray(g?.rounds) ? g.rounds.length * 3 : (g?.shots || []).length;
+
+function gameFlagTable(g) {
   const t = {};
-  for (let f = 1; f <= 5; f++) t[f] = { m: 0, a: 0, pts: 0 };
-  shots.forEach(s => { t[s.flag].a += 1; if (s.made) { t[s.flag].m += 1; t[s.flag].pts += flagPts(s.flag); } });
+  for (let f = 1; f <= 5; f++) t[f] = { m: 0, a: 0, pts: 0, rounds: 0 };
+  if (Array.isArray(g?.rounds)) {
+    g.rounds.forEach(r => {
+      t[r.flag].rounds += 1; t[r.flag].a += 3; t[r.flag].m += r.made;
+      t[r.flag].pts += r.made * flagPts(r.flag);
+    });
+  } else {
+    (g?.shots || []).forEach(s => {
+      t[s.flag].a += 1;
+      if (s.made) { t[s.flag].m += 1; t[s.flag].pts += flagPts(s.flag); }
+    });
+  }
   return t;
 }
+
+// leaderboard: every finished run, best score first
+function leaderboard(games) {
+  return games
+    .map((g, idx) => ({ idx, name: g.name || "Me", score: gameScore(g), when: g.startedAt, high: Math.max(0, ...(g.rounds || []).map(r => r.flag), ...(g.shots || []).map(s => s.flag)) }))
+    .sort((a, b) => b.score - a.score || a.when - b.when);
+}
+const rankOf = (games, idx) => leaderboard(games).findIndex(e => e.idx === idx) + 1;
+const medal = (rank) => (rank === 1 ? "🥇" : rank === 2 ? "🥈" : rank === 3 ? "🥉" : null);
 
 const ROLL_WINDOW = 60; // putts
 function trendData(sessions) {
@@ -209,23 +249,211 @@ function trendData(sessions) {
 }
 
 // ---------- storage ----------
-// Local to this device, via localStorage. No account, no server.
+// IndexedDB is the primary store: iOS evicts localStorage far more readily,
+// which is what loses a session. localStorage is kept as a mirror so a failure
+// in either one can't take your history with it.
 const NS = "puttingyard:";
+const DB_NAME = "putting-yard", STORE = "kv";
+
+let dbPromise = null;
+function openDb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve) => {
+      try {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains(STORE)) req.result.createObjectStore(STORE); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => resolve(null);
+        req.onblocked = () => resolve(null);
+      } catch { resolve(null); }
+    });
+  }
+  return dbPromise;
+}
+
+function idb(mode, fn) {
+  return openDb().then(db => {
+    if (!db) return undefined;
+    return new Promise((resolve) => {
+      try {
+        const tx = db.transaction(STORE, mode);
+        const req = fn(tx.objectStore(STORE));
+        tx.onabort = tx.onerror = () => resolve(undefined);
+        if (req) { req.onsuccess = () => resolve(req.result); req.onerror = () => resolve(undefined); }
+        else { tx.oncomplete = () => resolve(undefined); }
+      } catch { resolve(undefined); }
+    });
+  }).catch(() => undefined);
+}
+
 async function loadKey(key) {
+  const fromIdb = await idb("readonly", (s) => s.get(key));
+  if (fromIdb !== undefined && fromIdb !== null) return fromIdb;
   try { const v = localStorage.getItem(NS + key); return v ? JSON.parse(v) : null; }
   catch { return null; }
 }
+
 async function saveKey(key, val) {
+  // write both; whichever survives wins on next load
+  idb("readwrite", (s) => s.put(val, key));
   try { localStorage.setItem(NS + key, JSON.stringify(val)); }
-  catch (e) { console.error("save failed", e); }
+  catch (e) { console.error("localStorage mirror failed", e); }
 }
+
 async function deleteKey(key) {
+  idb("readwrite", (s) => s.delete(key));
   try { localStorage.removeItem(NS + key); } catch { /* nothing to remove */ }
+}
+
+// ---------- compact encoding for cloud backup ----------
+// Rounds squeeze down to a few numbers each so the synced file stays tiny.
+const ORDERS = [
+  ["orange", "red", "green"], ["orange", "green", "red"],
+  ["red", "orange", "green"], ["red", "green", "orange"],
+  ["green", "orange", "red"], ["green", "red", "orange"],
+];
+const orderIndex = (o) => {
+  const i = ORDERS.findIndex(x => x[0] === o[0] && x[1] === o[1] && x[2] === o[2]);
+  return i < 0 ? 0 : i;
+};
+
+function packSession(s) {
+  return {
+    s: s.startedAt,
+    e: s.endedAt || null,
+    r: s.rounds.map(r => {
+      const o = roundOrder(r);
+      const bits = o.reduce((n, k, i) => n | (r.results[k] ? 1 << i : 0), 0);
+      return [r.flag, bits, Math.round(r.dur || 0), orderIndex(o), r.prevWatch ? 1 : 0];
+    }),
+  };
+}
+function unpackSession(p) {
+  return {
+    startedAt: p.s,
+    endedAt: p.e || undefined,
+    rounds: (p.r || []).map(([flag, bits, dur, oi, pw]) => {
+      const order = ORDERS[oi] || DEFAULT_ORDER;
+      const results = {};
+      order.forEach((k, i) => { results[k] = !!(bits & (1 << i)); });
+      const made = order.reduce((n, k) => n + (results[k] ? 1 : 0), 0);
+      return { flag, results, made, order, dur, prevFlag: flag, prevWatch: !!pw };
+    }),
+  };
+}
+function packGame(g) {
+  const base = { s: g.startedAt, e: g.endedAt || null, c: gameScore(g), n: g.name || "Me" };
+  return Array.isArray(g.rounds)
+    ? { ...base, r: g.rounds.map(x => [x.flag, x.made, x.prevWatch ? 1 : 0]) }   // ladder run
+    : { ...base, h: (g.shots || []).map(x => [x.flag, x.made ? 1 : 0]) };        // legacy free-shot run
+}
+function unpackGame(p) {
+  const base = { startedAt: p.s, endedAt: p.e || undefined, name: p.n || "Me" };
+  if (p.r) {
+    const rounds = p.r.map(([flag, made, pw]) => ({ flag, made, prevFlag: flag, prevWatch: !!pw }));
+    return { ...base, rounds, score: p.c ?? gameScore({ rounds }) };
+  }
+  const shots = (p.h || []).map(([flag, made]) => ({ flag, made: !!made }));
+  return { ...base, shots, score: p.c ?? gameScore({ shots }) };
+}
+const packAll = (sessions, games, distances) => ({
+  v: 1, t: Date.now(), d: distances,
+  s: sessions.map(packSession), g: games.map(packGame),
+});
+const unpackAll = (p) => ({
+  sessions: (p.s || []).map(unpackSession),
+  games: (p.g || []).map(unpackGame),
+  distances: p.d || {},
+});
+
+// merge two lists of records by start time; newer/longer wins on collisions
+function mergeRecords(a, b, sizeOf) {
+  const by = new Map();
+  [...a, ...b].forEach(x => {
+    const prev = by.get(x.startedAt);
+    if (!prev || sizeOf(x) > sizeOf(prev)) by.set(x.startedAt, x);
+  });
+  return [...by.values()].sort((x, y) => x.startedAt - y.startedAt);
+};
+
+// ---------- GitHub sync ----------
+// Commits a single JSON file to a repo you own using a fine-grained token.
+const b64encode = (str) => btoa(unescape(encodeURIComponent(str)));
+const b64decode = (str) => decodeURIComponent(escape(atob(str.replace(/\s/g, ""))));
+
+async function ghRequest(cfg, method, extra) {
+  const url = `https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${cfg.path}`;
+  const res = await fetch(method === "GET" ? `${url}?ref=${encodeURIComponent(cfg.branch || "main")}&t=${Date.now()}` : url, {
+    method,
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      ...(method === "PUT" ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(extra ? { body: JSON.stringify(extra) } : {}),
+  });
+  return res;
+}
+
+async function ghPull(cfg) {
+  const res = await ghRequest(cfg, "GET");
+  if (res.status === 404) return { data: null, sha: null };       // nothing saved yet
+  if (res.status === 401) throw new Error("Token rejected — check it hasn't expired.");
+  if (res.status === 403) throw new Error("Token lacks Contents write access to this repo.");
+  if (!res.ok) throw new Error(`GitHub said ${res.status}.`);
+  const j = await res.json();
+  return { data: JSON.parse(b64decode(j.content)), sha: j.sha };
+}
+
+async function ghPush(cfg, payload, sha) {
+  const res = await ghRequest(cfg, "PUT", {
+    message: `putting yard sync ${new Date().toISOString()}`,
+    content: b64encode(JSON.stringify(payload)),
+    branch: cfg.branch || "main",
+    ...(sha ? { sha } : {}),
+  });
+  if (res.status === 409) throw new Error("Someone else synced first — try again.");
+  if (!res.ok) throw new Error(`Push failed (${res.status}).`);
+  return res.json();
 }
 
 // haptics: Android Chrome buzzes; iOS Safari ignores this silently
 function buzz(pattern) {
   try { if (navigator.vibrate) navigator.vibrate(pattern); } catch { /* unsupported */ }
+}
+
+// ---------- icons ----------
+// Monochrome line icons, sized to sit beside text. They inherit `color`,
+// so they read as part of the label rather than as decoration.
+function Icon({ name, size = 15, style }) {
+  const common = {
+    width: size, height: size, viewBox: "0 0 24 24", fill: "none",
+    stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", strokeLinejoin: "round",
+    style: { flexShrink: 0, ...style },
+  };
+  const paths = {
+    // disc, seen at a slight angle
+    disc: <><ellipse cx="12" cy="12" rx="9" ry="5.5" /><ellipse cx="12" cy="12" rx="4" ry="2.2" /></>,
+    // basket: chains above, band below
+    basket: <><path d="M12 4v16" /><path d="M5.5 8.5h13" /><path d="M8 8.5l4 5 4-5" /><path d="M6.5 14.5h11l-1.5 2.5h-8z" /><path d="M8.5 20h7" /></>,
+    // pennant on a pole
+    flag: <><path d="M6 3v18" /><path d="M6 4.5l12 3.5-12 3.5z" /></>,
+    // upward progression
+    climb: <><path d="M4 19h16" /><path d="M7 16V9" /><path d="M12 16V5" /><path d="M17 16v-4" /></>,
+    trophy: <><path d="M8 4h8v5a4 4 0 0 1-8 0z" /><path d="M8 5H5v1a3 3 0 0 0 3 3" /><path d="M16 5h3v1a3 3 0 0 1-3 3" /><path d="M12 13v4" /><path d="M9 20h6" /><path d="M10 17h4l.5 3h-5z" /></>,
+    target: <><circle cx="12" cy="12" r="8.5" /><circle cx="12" cy="12" r="4.5" /><circle cx="12" cy="12" r="1" /></>,
+    trend: <><path d="M3 17l5-5 4 3 6-7" /><path d="M14 8h5v5" /></>,
+    clock: <><circle cx="12" cy="12" r="8.5" /><path d="M12 7v5l3 2" /></>,
+    grid: <><path d="M4 4h16v16H4z" /><path d="M4 10h16M4 15h16M10 4v16M15 4v16" /></>,
+    route: <><circle cx="6" cy="6" r="2.2" /><circle cx="18" cy="18" r="2.2" /><path d="M8 6h6a4 4 0 0 1 0 8H10a4 4 0 0 0 0 8" /></>,
+    cloud: <><path d="M7 18h10a4 4 0 0 0 .5-8 5.5 5.5 0 0 0-10.6 1.3A3.6 3.6 0 0 0 7 18z" /></>,
+    save: <><path d="M12 3v11" /><path d="M8 11l4 4 4-4" /><path d="M4 19h16" /></>,
+    ruler: <><path d="M3 9h18v6H3z" /><path d="M7 9v3M11 9v4M15 9v3M19 9v4" /></>,
+    person: <><circle cx="12" cy="8" r="3.4" /><path d="M5 20a7 7 0 0 1 14 0" /></>,
+    spark: <><path d="M12 3v3M12 18v3M3 12h3M18 12h3M6 6l2 2M16 16l2 2M18 6l-2 2M8 16l-2 2" /><circle cx="12" cy="12" r="3" /></>,
+  };
+  return <svg {...common} aria-hidden="true">{paths[name] || paths.disc}</svg>;
 }
 
 // ---------- small pieces ----------
@@ -250,10 +478,13 @@ function FlagRail({ flag, watch, highest }) {
   );
 }
 
-function StatBlock({ title, children }) {
+function StatBlock({ title, icon, children }) {
   return (
     <div className="rounded-2xl p-4 mb-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
-      <div style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mb-2">{title}</div>
+      <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
+        {icon && <Icon name={icon} size={14} />}
+        <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>{title}</span>
+      </div>
       {children}
     </div>
   );
@@ -282,7 +513,7 @@ function StatsBody({ segments, distances = {} }) {
         <BigNum label="Watch saved" value={s.watchSaved + s.watchLost ? `${s.watchSaved}/${s.watchSaved + s.watchLost}` : "—"} />
       </div>
 
-      <StatBlock title="By flag">
+      <StatBlock title="By flag" icon="flag">
         {[1, 2, 3, 4, 5].map(f => (
           <div key={f} className="flex items-center gap-2 py-1">
             <span className="flex flex-col items-center" style={{ width: 34 }}>
@@ -297,7 +528,7 @@ function StatsBody({ segments, distances = {} }) {
         ))}
       </StatBlock>
 
-      <StatBlock title="Rounds to advance">
+      <StatBlock title="Rounds to advance" icon="climb">
         <div className="flex gap-2">
           {[1, 2, 3, 4].map(f => (
             <div key={f} className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
@@ -312,7 +543,7 @@ function StatsBody({ segments, distances = {} }) {
       </StatBlock>
 
       {s.late.a > 0 && (
-        <StatBlock title="Warm-up effect">
+        <StatBlock title="Warm-up effect" icon="spark">
           <div className="flex gap-2">
             <div className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
               <div style={{ ...disp, fontWeight: 800, fontSize: 22, lineHeight: 1 }}>{pct(s.early)}</div>
@@ -334,7 +565,7 @@ function StatsBody({ segments, distances = {} }) {
         </StatBlock>
       )}
 
-      <StatBlock title="By disc">
+      <StatBlock title="By disc" icon="disc">
         <div className="flex gap-2">
           {DEFAULT_ORDER.map(k => (
             <div key={k} className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
@@ -346,7 +577,7 @@ function StatsBody({ segments, distances = {} }) {
         </div>
       </StatBlock>
 
-      <StatBlock title="By throw position">
+      <StatBlock title="By throw position" icon="target">
         <div className="flex gap-2">
           {["1st", "2nd", "3rd"].map((lbl, i) => (
             <div key={lbl} className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
@@ -357,7 +588,7 @@ function StatsBody({ segments, distances = {} }) {
         </div>
       </StatBlock>
 
-      <StatBlock title="Disc × flag (makes/attempts)">
+      <StatBlock title="Disc × flag" icon="grid">
         <table className="w-full" style={{ fontSize: 13 }}>
           <thead>
             <tr>
@@ -398,7 +629,7 @@ function TrendBlock({ sessions }) {
     return <circle key={payload.n} cx={cx} cy={cy} r={r} fill="#C6D9CC" stroke={C.fairway} strokeWidth={1} fillOpacity={0.8} />;
   };
   return (
-    <StatBlock title="Trend">
+    <StatBlock title="Trend" icon="trend">
       <div className="flex items-baseline gap-2 mb-1">
         <span style={{ ...disp, fontWeight: 800, fontSize: 26, lineHeight: 1 }}>{pct(last5)}</span>
         <span style={{ fontSize: 12, color: C.faint }}>last 5 sessions ({last5.a} putts)</span>
@@ -438,7 +669,7 @@ function PersonalBests({ sessions }) {
   ].filter(Boolean);
   if (!rows.length) return null;
   return (
-    <StatBlock title="Personal bests">
+    <StatBlock title="Personal bests" icon="trophy">
       {rows.map(([label, val, idx]) => (
         <div key={label} className="flex items-center justify-between py-1.5" style={{ borderBottom: `1px solid ${C.line}` }}>
           <span style={{ fontSize: 14 }}>{label}</span>
@@ -448,6 +679,36 @@ function PersonalBests({ sessions }) {
           </span>
         </div>
       ))}
+    </StatBlock>
+  );
+}
+
+function Leaderboard({ board, games, highlight = null, onPick, limit = 10 }) {
+  if (!board.length) return null;
+  const rows = board.slice(0, limit);
+  return (
+    <StatBlock icon="trophy" title={`Leaderboard · ${board.length} run${board.length > 1 ? "s" : ""}`}>
+      {rows.map((e, i) => {
+        const rank = i + 1;
+        const me = e.idx === highlight;
+        return (
+          <button key={e.idx} onClick={() => onPick && onPick(e.idx)}
+            className="w-full flex items-center gap-2 py-2 text-left"
+            style={{ borderTop: i ? `1px solid ${C.line}` : "none", background: me ? "#F2F7F3" : "transparent" }}>
+            <span style={{ ...disp, fontWeight: 800, fontSize: 17, width: 30, color: rank <= 3 ? C.ink : C.faint }}>
+              {medal(rank) || rank}
+            </span>
+            <span className="flex-1" style={{ fontSize: 14, fontWeight: me ? 700 : 500 }}>
+              {e.name}
+              <span style={{ fontSize: 12, color: C.faint, fontWeight: 400 }} className="ml-2">{fmtDate(e.when)}</span>
+            </span>
+            <span style={{ ...disp, fontWeight: 800, fontSize: 20 }}>{e.score}</span>
+          </button>
+        );
+      })}
+      {board.length > limit && (
+        <div style={{ fontSize: 12, color: C.faint }} className="mt-2">Showing top {limit} of {board.length}.</div>
+      )}
     </StatBlock>
   );
 }
@@ -474,6 +735,9 @@ export default function App() {
   const [sessions, setSessions] = useState([]);
   const [active, setActive] = useState(null); // {startedAt, flag, watch, rounds, order, anchor}
   const [pending, setPending] = useState({ orange: null, red: null, green: null });
+  const [gamePending, setGamePending] = useState({ orange: null, red: null, green: null });
+  const [playerName, setPlayerName] = useState("Me");
+  const [updateReady, setUpdateReady] = useState(false);
   const [banner, setBanner] = useState(null);
   const [detailIdx, setDetailIdx] = useState(null);
   const [confirmEnd, setConfirmEnd] = useState(false);
@@ -485,6 +749,7 @@ export default function App() {
   const [gameIdx, setGameIdx] = useState(null);
   const [confirmQuit, setConfirmQuit] = useState(false);
   const committing = useRef(false);
+  const gameCommitting = useRef(false);
   const wakeLock = useRef(null);
 
   useEffect(() => {
@@ -494,6 +759,14 @@ export default function App() {
       const d = await loadKey("dg-flags");
       const g = await loadKey("dg-games");
       const ga = await loadKey("dg-game-active");
+      const pn = await loadKey("dg-player");
+      if (pn) setPlayerName(pn);
+      const cfg = await loadKey("dg-gh");
+      const ls = await loadKey("dg-lastsync");
+      if (cfg) setGh(cfg);
+      if (ls) setLastSync(ls);
+      // ask the browser not to evict our data
+      try { if (navigator.storage?.persist) await navigator.storage.persist(); } catch { /* not supported */ }
       if (s) setSessions(s);
       if (a) setActive(a);
       if (d) setDistances(d);
@@ -501,6 +774,13 @@ export default function App() {
       if (ga) setGame(ga);
       setLoaded(true);
     })();
+  }, []);
+
+  // a new build is live on the server; offer a one-tap reload
+  useEffect(() => {
+    const onReady = () => setUpdateReady(true);
+    window.addEventListener("app-update-ready", onReady);
+    return () => window.removeEventListener("app-update-ready", onReady);
   }, []);
 
   // keep the screen awake during a session (Android + iOS 16.4+)
@@ -531,6 +811,58 @@ export default function App() {
   };
 
   const fileRef = useRef(null);
+  const [gh, setGh] = useState(null);            // {owner, repo, token, path, branch}
+  const [ghForm, setGhForm] = useState({ owner: "", repo: "", token: "" });
+  const [syncMsg, setSyncMsg] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [lastSync, setLastSync] = useState(null);
+  const [showSync, setShowSync] = useState(false);
+
+  const saveGh = (cfg) => { setGh(cfg); saveKey("dg-gh", cfg); };
+
+  // pull remote, merge with local, push the union back
+  const syncNow = async (cfg = gh, quiet = false) => {
+    if (!cfg || syncing) return;
+    setSyncing(true);
+    if (!quiet) setSyncMsg("Syncing…");
+    try {
+      const { data, sha } = await ghPull(cfg);
+      let ns = sessions, ngm = games, nd = distances;
+      if (data) {
+        const remote = unpackAll(data);
+        ns = mergeRecords(sessions, remote.sessions, x => x.rounds.length);
+        ngm = mergeRecords(games, remote.games, x => (x.rounds || x.shots || []).length);
+        nd = { ...remote.distances, ...distances };
+        setSessions(ns); setGames(ngm); setDistances(nd);
+        saveKey("dg-sessions", ns); saveKey("dg-games", ngm); saveKey("dg-flags", nd);
+      }
+      await ghPush(cfg, packAll(ns, ngm, nd), sha);
+      const now = Date.now();
+      setLastSync(now); saveKey("dg-lastsync", now);
+      setSyncMsg(`Synced — ${ns.length} sessions, ${ngm.length} games.`);
+    } catch (e) {
+      setSyncMsg(e.message || "Sync failed.");
+    }
+    setSyncing(false);
+    setTimeout(() => setSyncMsg(""), 6000);
+  };
+
+  const connectGh = async () => {
+    const cfg = {
+      owner: ghForm.owner.trim(), repo: ghForm.repo.trim(),
+      token: ghForm.token.trim(), path: "putting-data.json", branch: "main",
+    };
+    if (!cfg.owner || !cfg.repo || !cfg.token) { setSyncMsg("Fill in all three fields."); return; }
+    saveGh(cfg);
+    setGhForm({ ...ghForm, token: "" });
+    await syncNow(cfg);
+  };
+
+  const disconnectGh = () => {
+    setGh(null); deleteKey("dg-gh"); setSyncMsg("Disconnected. Data stays on this device.");
+    setTimeout(() => setSyncMsg(""), 5000);
+  };
+
   const [backupMsg, setBackupMsg] = useState("");
 
   const exportData = () => {
@@ -569,6 +901,15 @@ export default function App() {
     }
     setTimeout(() => setBackupMsg(""), 6000);
   };
+
+  // pull from GitHub when the app opens, so a new phone or a wiped
+  // browser picks the history back up on its own
+  const pulledOnce = useRef(false);
+  useEffect(() => {
+    if (!loaded || !gh || pulledOnce.current) return;
+    pulledOnce.current = true;
+    syncNow(gh, true);
+  }, [loaded, gh]);
 
   // last-chance save if the app is backgrounded or closed mid-round
   const liveRef = useRef({ active: null, pending: null, game: null });
@@ -684,55 +1025,78 @@ export default function App() {
     const list = [...sessions, done];
     setSessions(list); setActive(null); setDetailIdx(list.length - 1);
     saveKey("dg-sessions", list); deleteKey("dg-active");
+    if (gh) setTimeout(() => syncNow(gh, true), 400);
     setConfirmDelete(false);
     setView("detail");
   };
 
   const startGame = () => {
-    const g = { startedAt: Date.now(), flag: game?.flag || 1, shots: [] };
-    setGame(g); setBanner(null); setConfirmQuit(false); setView("game");
+    const g = { startedAt: Date.now(), flag: 1, watch: false, rounds: [], name: playerName || "Me", pending: null };
+    setGame(g); setGamePending({ orange: null, red: null, green: null });
+    setBanner(null); setConfirmQuit(false); setView("game");
     saveKey("dg-game-active", g);
   };
 
-  const resumeGame = () => { setBanner(null); setConfirmQuit(false); setView("game"); };
-
-  const pickGameFlag = (f) => {
+  const resumeGame = () => {
+    let restored = { orange: null, red: null, green: null };
     setGame(prev => {
-      const next = { ...prev, flag: f };
-      saveKey("dg-game-active", next);
-      return next;
+      restored = prev.pending || restored;
+      return prev;
     });
+    setGamePending(restored);
+    setBanner(null); setConfirmQuit(false); setView("game");
   };
 
   const finishGame = (g) => {
-    const done = { startedAt: g.startedAt, endedAt: Date.now(), shots: g.shots, score: gameScore(g.shots) };
+    const done = {
+      startedAt: g.startedAt, endedAt: Date.now(), name: g.name || "Me",
+      rounds: g.rounds, score: gameScore(g),
+    };
     const list = [...games, done];
     setGames(list); setGame(null); setGameIdx(list.length - 1);
     saveKey("dg-games", list); deleteKey("dg-game-active");
+    if (gh) setTimeout(() => syncNow(gh, true), 400);
     setConfirmDelete(false);
     setView("gamedetail");
   };
 
-  const gameShot = (made) => {
+  const gameAnswer = (key, made) => {
+    if (gameCommitting.current) return;
+    const p = { ...gamePending, [key]: made };
+    setGamePending(p);
+    if (DEFAULT_ORDER.every(k => p[k] !== null)) {
+      gameCommitting.current = true;
+      setTimeout(() => commitGameRound(p), 350);
+    } else {
+      setGame(prev => { const next = { ...prev, pending: p }; saveKey("dg-game-active", next); return next; });
+    }
+  };
+
+  const commitGameRound = (p) => {
     setGame(prev => {
-      const shot = { flag: prev.flag, made };
-      const next = { ...prev, shots: [...prev.shots, shot] };
-      const pts = made ? flagPts(prev.flag) : 0;
+      const made = DEFAULT_ORDER.reduce((n, k) => n + (p[k] ? 1 : 0), 0);
+      const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
+      const pts = made * flagPts(prev.flag);
+      const round = { flag: prev.flag, made, prevFlag: prev.flag, prevWatch: prev.watch };
+      const next = { ...prev, flag: nf, watch: nw, rounds: [...prev.rounds, round], pending: null };
       queueMicrotask(() => {
-        setBanner(made ? `Made — +${pts} pts` : "Miss — 0 pts");
-        buzz(made ? [30] : [80]);
-        if (next.shots.length >= GAME_SHOTS) finishGame(next);
+        setBanner(`${made}/3 at flag ${prev.flag} — +${pts} pts · ${msg.replace(/^\d\/3 — /, "")}`);
+        buzz(nf > prev.flag ? [40, 60, 40, 60, 80] : nf < prev.flag ? [180] : made >= 2 ? [30] : [60, 50, 60]);
+        if (next.rounds.length >= GAME_ROUNDS) finishGame(next);
         else saveKey("dg-game-active", next);
       });
       return next;
     });
+    setGamePending({ orange: null, red: null, green: null });
+    gameCommitting.current = false;
   };
 
-  const undoShot = () => {
-    if (!game || game.shots.length === 0) return;
-    const last = game.shots[game.shots.length - 1];
-    const next = { ...game, shots: game.shots.slice(0, -1), flag: last.flag };
-    setGame(next); setBanner(`Undid shot ${game.shots.length}`);
+  const undoGameRound = () => {
+    if (!game || game.rounds.length === 0) return;
+    const last = game.rounds[game.rounds.length - 1];
+    const next = { ...game, flag: last.prevFlag, watch: last.prevWatch, rounds: game.rounds.slice(0, -1), pending: null };
+    setGame(next); setGamePending({ orange: null, red: null, green: null });
+    setBanner(`Undid round ${game.rounds.length}`);
     saveKey("dg-game-active", next);
   };
 
@@ -759,6 +1123,15 @@ export default function App() {
   // ---------- screens ----------
   const shell = children => (
     <div style={{ ...body, background: C.paper, color: C.ink, minHeight: "100dvh", paddingTop: "env(safe-area-inset-top)", paddingBottom: "env(safe-area-inset-bottom)" }}>
+      {updateReady && view !== "session" && view !== "game" && (
+        <button
+          onClick={() => window.dispatchEvent(new CustomEvent("app-apply-update"))}
+          className="w-full px-4 py-3 text-left flex items-center justify-between"
+          style={{ background: C.amber, color: "#fff", ...disp, fontWeight: 700, fontSize: 17 }}>
+          <span>New version available</span>
+          <span style={{ textDecoration: "underline" }}>Update</span>
+        </button>
+      )}
       {children}
     </div>
   );
@@ -844,89 +1217,119 @@ export default function App() {
 
   // ----- 30-SHOT GAME -----
   if (view === "game" && game) {
-    const score = gameScore(game.shots);
-    const shotNum = game.shots.length + 1;
+    const score = gameScore(game);
+    const roundNum = game.rounds.length + 1;
+    const answered = DEFAULT_ORDER.filter(k => gamePending[k] !== null).length;
     return shell(
       <div className="flex flex-col px-3 pt-3 pb-3" style={{ height: "100dvh" }}>
         {/* header */}
         <div className="flex items-center justify-between mb-1">
-          <div style={{ ...disp, fontWeight: 800, fontSize: 22 }}>Shot {shotNum}/{GAME_SHOTS}</div>
+          <div style={{ ...disp, fontWeight: 800, fontSize: 22 }}>Round {roundNum}/{GAME_ROUNDS}</div>
           <div className="flex items-center gap-2">
-            <span className="rounded-full px-3 py-1" style={{ background: C.ink, color: "#fff", ...disp, fontWeight: 800, fontSize: 17 }}>{score} pts</span>
+            <span className="rounded-full px-3 py-1 flex items-center gap-1" style={{ background: C.ink, color: "#fff", ...disp, fontWeight: 800, fontSize: 17 }}>
+              <Icon name="trophy" size={14} />{score} pts
+            </span>
+            {game.watch && (
+              <span className="rounded-full px-2.5 py-1" style={{ background: C.amberSoft, color: C.amber, ...disp, fontWeight: 700, fontSize: 14 }}>WATCH</span>
+            )}
             {!confirmQuit ? (
               <button onClick={() => setConfirmQuit(true)} className="rounded-full px-4 py-2" style={{ border: `1.5px solid ${C.line}`, color: C.faint, fontSize: 14, fontWeight: 600 }}>Quit</button>
             ) : (
-              <button onClick={quitGame} className="rounded-full px-4 py-2" style={{ background: C.red, color: "#fff", fontSize: 14, fontWeight: 600 }}>Discard game?</button>
+              <button onClick={quitGame} className="rounded-full px-4 py-2" style={{ background: C.red, color: "#fff", fontSize: 14, fontWeight: 600 }}>Discard run?</button>
             )}
           </div>
         </div>
 
-        {/* banner */}
-        <div className="rounded-xl px-3 py-2 text-center mb-2" style={{ background: banner ? C.ink : "#EDEAE0", color: banner ? "#fff" : C.faint, ...disp, fontWeight: 700, fontSize: 17, minHeight: 38 }}>
-          {banner || "Pick your flag, then log the shot"}
+        {/* flag rail */}
+        <FlagRail flag={game.flag} watch={game.watch} highest={Math.max(game.flag, ...game.rounds.map(r => r.flag), 1)} />
+        <div className="text-center mt-1 mb-1">
+          <span style={{ ...disp, fontWeight: 800, fontSize: 34, lineHeight: 1 }}>FLAG {game.flag}</span>
+          <span style={{ ...disp, fontWeight: 700, fontSize: 19, color: C.fairway }} className="ml-2">
+            {flagPts(game.flag)} pt{flagPts(game.flag) > 1 ? "s" : ""} a make
+          </span>
+          {ft(game.flag) && <span style={{ ...disp, fontWeight: 700, fontSize: 17, color: C.faint }} className="ml-2">{ft(game.flag)}</span>}
         </div>
 
-        {/* flag picker */}
-        <div className="flex gap-1.5 mb-2">
-          {[1, 2, 3, 4, 5].map(f => {
-            const sel = game.flag === f;
+        {/* banner */}
+        <div className="rounded-xl px-3 py-2 text-center mb-2" style={{ background: banner ? C.ink : "#EDEAE0", color: banner ? "#fff" : C.faint, ...disp, fontWeight: 700, fontSize: 17, minHeight: 38 }}>
+          {banner || `Log all three putters (${answered}/3)`}
+        </div>
+
+        {/* three putters */}
+        <div className="flex-1 flex flex-col gap-2 min-h-0">
+          {DEFAULT_ORDER.map(k => {
+            const v = gamePending[k];
             return (
-              <button key={f} onClick={() => pickGameFlag(f)} className="flex-1 rounded-2xl py-2 flex flex-col items-center"
-                style={{
-                  background: sel ? C.fairway : C.card,
-                  border: sel ? `2px solid ${C.fairway}` : `2px solid ${C.line}`,
-                  color: sel ? "#fff" : C.ink,
-                }}>
-                <span style={{ ...disp, fontWeight: 800, fontSize: 24, lineHeight: 1 }}>{f}</span>
-                <span style={{ ...disp, fontWeight: 700, fontSize: 13, color: sel ? "rgba(255,255,255,0.85)" : C.faint }}>
-                  {flagPts(f)} pt{flagPts(f) > 1 ? "s" : ""}{distances[f] ? ` · ${distances[f]}ft` : ""}
-                </span>
-              </button>
+              <div key={k} className="flex-1 flex gap-2 min-h-0">
+                <div className="flex flex-col items-center justify-center rounded-2xl" style={{ width: 58, background: DISC[k].color }}>
+                  <span style={{ ...disp, fontWeight: 800, fontSize: 15, color: "#fff", letterSpacing: "0.04em" }}>{DISC[k].label}</span>
+                </div>
+                <button onClick={() => gameAnswer(k, true)} className="flex-1 rounded-2xl"
+                  style={{
+                    background: v === true ? C.fairway : C.card,
+                    color: v === true ? "#fff" : C.ink,
+                    border: v === true ? `2px solid ${C.fairway}` : `2px solid ${C.line}`,
+                    ...disp, fontWeight: 800, fontSize: 26,
+                  }}>MADE</button>
+                <button onClick={() => gameAnswer(k, false)} className="flex-1 rounded-2xl"
+                  style={{
+                    background: v === false ? C.miss : C.card,
+                    color: v === false ? "#fff" : C.faint,
+                    border: v === false ? `2px solid ${C.miss}` : `2px solid ${C.line}`,
+                    ...disp, fontWeight: 800, fontSize: 26,
+                  }}>MISS</button>
+              </div>
             );
           })}
         </div>
 
-        {/* made / miss */}
-        <div className="flex-1 flex gap-2 min-h-0">
-          <button onClick={() => gameShot(true)} className="flex-1 rounded-2xl"
-            style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 34 }}>
-            MADE<div style={{ fontSize: 17, fontWeight: 700, opacity: 0.85 }}>+{flagPts(game.flag)} pts</div>
-          </button>
-          <button onClick={() => gameShot(false)} className="flex-1 rounded-2xl"
-            style={{ background: C.card, color: C.faint, border: `2px solid ${C.line}`, ...disp, fontWeight: 800, fontSize: 34 }}>
-            MISS
-          </button>
-        </div>
-
         {/* undo */}
-        <button onClick={undoShot} disabled={game.shots.length === 0} className="mt-2 rounded-2xl py-3 w-full"
-          style={{ border: `2px solid ${C.line}`, color: game.shots.length ? C.ink : C.line, ...disp, fontWeight: 700, fontSize: 19 }}>
-          Undo last shot
+        <button onClick={undoGameRound} disabled={game.rounds.length === 0} className="mt-2 rounded-2xl py-3 w-full"
+          style={{ border: `2px solid ${C.line}`, color: game.rounds.length ? C.ink : C.line, ...disp, fontWeight: 700, fontSize: 19 }}>
+          Undo last round
         </button>
       </div>
     );
   }
 
-  // ----- GAME DETAIL -----
+  // ----- GAME DETAIL (scorecard + leaderboard) -----
   if (view === "gamedetail" && gameIdx !== null && games[gameIdx]) {
     const g = games[gameIdx];
-    const t = gameFlagTable(g.shots);
-    const makes = g.shots.filter(s => s.made).length;
-    const best = Math.max(...games.map(o => o.score));
-    const isHigh = games.length >= 2 && g.score === best && games.findIndex(o => o.score === best) === gameIdx;
+    const t = gameFlagTable(g);
+    const makes = gameMakes(g), attempts = gameAttempts(g);
+    const board = leaderboard(games);
+    const rank = rankOf(games, gameIdx);
+    const isLadderRun = Array.isArray(g.rounds);
     return shell(
       <div className="px-4 pt-4 pb-8 max-w-md mx-auto">
         <button onClick={() => { setConfirmDelete(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Home</button>
-        <div style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>30-shot game</div>
-        <div style={{ fontSize: 13, color: C.faint }} className="mb-2">{fmtDate(g.startedAt)}</div>
-        {isHigh && (
-          <span className="inline-block rounded-full px-3 py-1 mb-3" style={{ background: C.amberSoft, color: C.amber, ...disp, fontWeight: 700, fontSize: 14 }}>HIGH SCORE</span>
-        )}
-        <div className="flex gap-2 mb-3">
-          <BigNum label="Score" value={g.score} />
-          <BigNum label="Makes" value={`${makes}/${g.shots.length}`} />
+        <div className="flex items-center gap-2">
+          <Icon name="trophy" size={24} style={{ color: C.fairway }} />
+          <span style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>Scored run</span>
         </div>
-        <StatBlock title="By flag">
+        <div style={{ fontSize: 13, color: C.faint }} className="mb-2">{g.name || "Me"} · {fmtDate(g.startedAt)}</div>
+
+        {/* score + placement */}
+        <div className="rounded-2xl p-4 mb-3 text-center" style={{ background: rank === 1 ? C.fairway : C.card, border: `1px solid ${rank === 1 ? C.fairway : C.line}`, color: rank === 1 ? "#fff" : C.ink }}>
+          <div style={{ ...disp, fontWeight: 800, fontSize: 56, lineHeight: 1 }}>{gameScore(g)}</div>
+          <div style={{ fontSize: 13, opacity: rank === 1 ? 0.9 : 0.7 }}>points out of {GAME_MAX} possible</div>
+          <div style={{ ...disp, fontWeight: 700, fontSize: 19 }} className="mt-2">
+            {medal(rank) ? `${medal(rank)} ` : ""}{rank === 1 ? "New high score" : `#${rank} of ${games.length}`}
+          </div>
+        </div>
+
+        <div className="flex gap-2 mb-3">
+          <BigNum label="Makes" value={`${makes}/${attempts}`} />
+          <BigNum label="Highest flag" value={Math.max(0, ...(g.rounds || []).map(r => r.flag), ...(g.shots || []).map(x => x.flag))} />
+        </div>
+
+        {isLadderRun && (
+          <StatBlock title="Progression" icon="route">
+            <Progression rounds={g.rounds} />
+          </StatBlock>
+        )}
+
+        <StatBlock title="Points by flag" icon="target">
           <table className="w-full" style={{ fontSize: 14 }}>
             <thead>
               <tr style={{ color: C.faint, fontWeight: 500 }}>
@@ -938,7 +1341,9 @@ export default function App() {
             <tbody>
               {[1, 2, 3, 4, 5].map(f => (
                 <tr key={f} style={{ borderTop: `1px solid ${C.line}`, color: t[f].a ? C.ink : C.line }}>
-                  <td className="py-1.5" style={{ ...disp, fontWeight: 700, fontSize: 16 }}>{f}{distances[f] ? <span style={{ fontSize: 11, color: C.faint, fontWeight: 400 }}> · {distances[f]}ft</span> : ""}</td>
+                  <td className="py-1.5" style={{ ...disp, fontWeight: 700, fontSize: 16 }}>
+                    {f}{distances[f] ? <span style={{ fontSize: 11, color: C.faint, fontWeight: 400 }}> · {distances[f]}ft</span> : ""}
+                  </td>
                   <td className="py-1.5 text-right">{t[f].a ? `${t[f].m}/${t[f].a}` : "·"}</td>
                   <td className="py-1.5 text-right" style={{ ...disp, fontWeight: 700, fontSize: 16 }}>{t[f].pts || "·"}</td>
                 </tr>
@@ -946,9 +1351,12 @@ export default function App() {
             </tbody>
           </table>
         </StatBlock>
+
+        <Leaderboard board={board} games={games} highlight={gameIdx} onPick={(i) => { setGameIdx(i); setConfirmDelete(false); }} />
+
         <button onClick={startGame} className="w-full rounded-2xl py-4 mt-1" style={{ background: C.ink, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>Play again</button>
         {!confirmDelete ? (
-          <button onClick={() => setConfirmDelete(true)} className="w-full rounded-2xl py-3 mt-3" style={{ border: `2px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 18 }}>Delete this game</button>
+          <button onClick={() => setConfirmDelete(true)} className="w-full rounded-2xl py-3 mt-3" style={{ border: `2px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 18 }}>Delete this run</button>
         ) : (
           <button onClick={() => deleteGame(gameIdx)} className="w-full rounded-2xl py-3 mt-3" style={{ background: C.red, color: "#fff", ...disp, fontWeight: 700, fontSize: 18 }}>Delete permanently?</button>
         )}
@@ -963,7 +1371,10 @@ export default function App() {
     return shell(
       <div className="px-4 pt-4 pb-8 max-w-md mx-auto">
         <button onClick={() => { setConfirmDelete(false); setView("home"); }} className="mb-3" style={{ color: C.faint, fontSize: 15, fontWeight: 600 }}>← Home</button>
-        <div style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>Session post mortem</div>
+        <div className="flex items-center gap-2">
+          <Icon name="clock" size={24} style={{ color: C.fairway }} />
+          <span style={{ ...disp, fontWeight: 800, fontSize: 32, lineHeight: 1.05 }}>Session post mortem</span>
+        </div>
         <div style={{ fontSize: 13, color: C.faint }} className="mb-2">
           {fmtDate(s.startedAt)}{totalSec != null ? ` · ${fmtDur(totalSec)}` : ""}
         </div>
@@ -984,7 +1395,7 @@ export default function App() {
             </div>
           ) : <div className="mb-2" />;
         })()}
-        <StatBlock title="Progression"><Progression rounds={s.rounds} /></StatBlock>
+        <StatBlock title="Progression" icon="route"><Progression rounds={s.rounds} /></StatBlock>
         <StatsBody segments={[s.rounds]} distances={distances} />
         <button onClick={startSession} className="w-full rounded-2xl py-4 mt-1" style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>Start new session</button>
         {!confirmDelete ? (
@@ -999,8 +1410,13 @@ export default function App() {
   // ----- HOME / HISTORY -----
   return shell(
     <div className="px-4 pt-6 pb-8 max-w-md mx-auto">
-      <div style={{ ...disp, fontWeight: 800, fontSize: 40, lineHeight: 1 }}>Putting yard</div>
-      <div style={{ fontSize: 14, color: C.faint }} className="mb-4">5 flags · 3 putters · earn your distance</div>
+      <div className="flex items-center gap-2">
+        <Icon name="basket" size={32} style={{ color: C.fairway }} />
+        <span style={{ ...disp, fontWeight: 800, fontSize: 40, lineHeight: 1 }}>Putting yard</span>
+      </div>
+      <div style={{ fontSize: 14, color: C.faint }} className="mb-4">
+        5 flags · 3 putters · earn your distance
+      </div>
 
       {active ? (
         <button onClick={resumeSession} className="w-full rounded-2xl py-4 mb-3" style={{ background: C.amber, color: "#fff", ...disp, fontWeight: 800, fontSize: 22 }}>
@@ -1014,30 +1430,27 @@ export default function App() {
 
       {game ? (
         <button onClick={resumeGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
-          Resume game — shot {game.shots.length + 1}/{GAME_SHOTS} · {gameScore(game.shots)} pts
+          Resume run — round {game.rounds.length + 1}/{GAME_ROUNDS} · flag {game.flag} · {gameScore(game)} pts
         </button>
       ) : (
         <button onClick={startGame} className="w-full rounded-2xl py-3 mb-3" style={{ background: C.card, color: C.ink, border: `2px solid ${C.ink}`, ...disp, fontWeight: 800, fontSize: 19 }}>
-          Play 30-shot game
+          Play scored run — 10 rounds
         </button>
       )}
 
       {games.length > 0 && (
         <>
-          <div style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mt-5 mb-2">
-            30-shot game · high score {Math.max(...games.map(g => g.score))}
+          <div className="flex items-center gap-1.5 mt-5 mb-2" style={{ color: C.faint }}>
+            <Icon name="trophy" size={16} />
+            <span style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+              Scored runs · best {Math.max(...games.map(g => gameScore(g)))} pts
+            </span>
           </div>
-          {games.map((g, i) => (
-            <button key={g.startedAt} onClick={() => { setGameIdx(i); setConfirmDelete(false); setView("gamedetail"); }}
-              className="w-full rounded-2xl p-3 mb-2 flex items-center justify-between text-left"
-              style={{ background: C.card, border: `1px solid ${C.line}` }}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: 15 }}>{fmtDate(g.startedAt)}</div>
-                <div style={{ fontSize: 13, color: C.faint }}>{g.shots.filter(s => s.made).length}/{g.shots.length} makes</div>
-              </div>
-              <span style={{ ...disp, fontWeight: 800, fontSize: 22 }}>{g.score} <span style={{ fontSize: 13, color: C.faint, fontWeight: 400 }}>pts</span></span>
-            </button>
-          )).reverse()}
+          <Leaderboard
+            board={leaderboard(games)}
+            games={games}
+            onPick={(i) => { setGameIdx(i); setConfirmDelete(false); setView("gamedetail"); }}
+          />
         </>
       )}
 
@@ -1048,7 +1461,10 @@ export default function App() {
           <PersonalBests sessions={sessions} />
           <StatsBody segments={sessions.map(s => s.rounds)} distances={distances} />
 
-          <div style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mt-5 mb-2">Sessions</div>
+          <div className="flex items-center gap-1.5 mt-5 mb-2" style={{ color: C.faint }}>
+            <Icon name="clock" size={16} />
+            <span style={{ ...disp, fontWeight: 700, fontSize: 17, letterSpacing: "0.08em", textTransform: "uppercase" }}>Sessions</span>
+          </div>
           {sessions.map((s, i) => {
             const st = computeStats([s.rounds]);
             const madeAll = s.rounds.reduce((n, r) => n + r.made, 0);
@@ -1075,7 +1491,26 @@ export default function App() {
       )}
 
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
-        <div style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mb-2">Flag distances (ft)</div>
+        <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
+          <Icon name="person" size={14} />
+          <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>Leaderboard name</span>
+        </div>
+        <input
+          value={playerName}
+          onChange={e => { setPlayerName(e.target.value); saveKey("dg-player", e.target.value); }}
+          placeholder="Me" maxLength={16}
+          className="w-full rounded-xl px-3 py-2"
+          style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+        <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
+          Scored runs are filed under this name. Change it before handing the phone to someone else and you'll both show up on the board.
+        </div>
+      </div>
+
+      <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
+          <Icon name="ruler" size={14} />
+          <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>Flag distances (ft)</span>
+        </div>
         <div className="flex gap-2">
           {[1, 2, 3, 4, 5].map(f => (
             <div key={f} className="flex-1 text-center">
@@ -1094,7 +1529,76 @@ export default function App() {
       </div>
 
       <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
-        <div style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase", color: C.faint }} className="mb-2">Backup</div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center gap-1.5" style={{ color: C.faint }}>
+            <Icon name="cloud" size={14} />
+            <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+              Cloud sync {gh ? "· on" : "· off"}
+            </span>
+          </div>
+          {gh && (
+            <button onClick={() => syncNow()} disabled={syncing} className="rounded-full px-3 py-1"
+              style={{ border: `1.5px solid ${C.line}`, color: syncing ? C.line : C.ink, fontSize: 13, fontWeight: 600 }}>
+              {syncing ? "Syncing…" : "Sync now"}
+            </button>
+          )}
+        </div>
+
+        {gh ? (
+          <>
+            <div style={{ fontSize: 13 }}>
+              Saving to <strong>{gh.owner}/{gh.repo}</strong> → {gh.path}
+            </div>
+            <div style={{ fontSize: 12, color: C.faint }} className="mt-1">
+              {syncMsg || (lastSync ? `Last synced ${fmtDate(lastSync)}. Syncs automatically when a session or game ends.` : "Not synced yet.")}
+            </div>
+            <button onClick={disconnectGh} className="w-full rounded-xl py-2 mt-3"
+              style={{ border: `1.5px solid ${C.line}`, color: C.faint, ...disp, fontWeight: 700, fontSize: 15 }}>
+              Disconnect
+            </button>
+          </>
+        ) : !showSync ? (
+          <>
+            <div style={{ fontSize: 13, color: C.faint, lineHeight: 1.5 }}>
+              Keep your history in a GitHub repo so it survives a wiped browser or a new phone.
+            </div>
+            <button onClick={() => setShowSync(true)} className="w-full rounded-xl py-3 mt-3"
+              style={{ border: `2px solid ${C.line}`, color: C.ink, ...disp, fontWeight: 700, fontSize: 16 }}>
+              Set up cloud sync
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="flex flex-col gap-2">
+              <input value={ghForm.owner} onChange={e => setGhForm({ ...ghForm, owner: e.target.value })}
+                placeholder="GitHub username" autoCapitalize="none" autoCorrect="off"
+                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+              <input value={ghForm.repo} onChange={e => setGhForm({ ...ghForm, repo: e.target.value })}
+                placeholder="Repo name (e.g. putting-data)" autoCapitalize="none" autoCorrect="off"
+                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+              <input value={ghForm.token} onChange={e => setGhForm({ ...ghForm, token: e.target.value })}
+                placeholder="Fine-grained token (github_pat_…)" type="password" autoCapitalize="none" autoCorrect="off"
+                className="w-full rounded-xl px-3 py-2" style={{ border: `1.5px solid ${C.line}`, background: "#FAF8F2", fontSize: 15 }} />
+            </div>
+            <button onClick={connectGh} disabled={syncing} className="w-full rounded-xl py-3 mt-2"
+              style={{ background: C.fairway, color: "#fff", ...disp, fontWeight: 700, fontSize: 17 }}>
+              {syncing ? "Connecting…" : "Connect and sync"}
+            </button>
+            <div style={{ fontSize: 12, color: syncMsg.includes("Synced") ? C.fairway : C.amber }} className="mt-2">
+              {syncMsg}
+            </div>
+            <div style={{ fontSize: 12, color: C.faint, lineHeight: 1.5 }} className="mt-2">
+              Use a <strong>private</strong> repo and a fine-grained token limited to just that repo, with Contents set to Read and write. The token is stored on this device only — never committed.
+            </div>
+          </>
+        )}
+      </div>
+
+      <div className="rounded-2xl p-4 mt-3" style={{ background: C.card, border: `1px solid ${C.line}` }}>
+        <div className="flex items-center gap-1.5 mb-2" style={{ color: C.faint }}>
+          <Icon name="save" size={14} />
+          <span style={{ ...disp, fontWeight: 700, fontSize: 15, letterSpacing: "0.08em", textTransform: "uppercase" }}>Backup</span>
+        </div>
         <div className="flex gap-2">
           <button onClick={exportData} className="flex-1 rounded-xl py-3"
             style={{ border: `2px solid ${C.line}`, color: C.ink, ...disp, fontWeight: 700, fontSize: 16 }}>
@@ -1108,8 +1612,15 @@ export default function App() {
         <input ref={fileRef} type="file" accept="application/json,.json" style={{ display: "none" }}
           onChange={e => { const f = e.target.files?.[0]; if (f) importData(f); e.target.value = ""; }} />
         <div style={{ fontSize: 12, color: C.faint }} className="mt-2">
-          {backupMsg || "Your data lives on this device only. Save a backup file now and then, or to move to a new phone."}
+          {backupMsg || (gh
+            ? "Synced to GitHub. A backup file is still handy if you ever want a copy you control outright."
+            : "Your data lives on this device only. Save a backup file now and then, or to move to a new phone.")}
         </div>
+      </div>
+
+      <div className="flex items-center justify-center gap-1.5 mt-4" style={{ color: C.line }}>
+        <Icon name="disc" size={13} />
+        <span style={{ fontSize: 12, color: C.faint }}>{BUILD}</span>
       </div>
 
     </div>
