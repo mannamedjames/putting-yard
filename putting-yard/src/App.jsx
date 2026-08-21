@@ -16,15 +16,10 @@ const C = {
   green: "#2F8F4E",
   miss: "#8A9389",
 };
-const DISC = {
-  orange: { label: "ORA", color: C.orange },
-  red: { label: "RED", color: C.red },
-  green: { label: "GRN", color: C.green },
-};
 const DEFAULT_ORDER = ["orange", "red", "green"];
 // Bump this every release. It's shown at the bottom of the home screen so you
 // can tell at a glance whether your phone picked up a new deploy.
-const BUILD = "v11.1 · durable store";
+const BUILD = "v12 · putts 1-2-3";
 const disp = { fontFamily: "'Barlow Condensed', sans-serif" };
 
 const body = { fontFamily: "'Barlow', sans-serif" };
@@ -57,6 +52,22 @@ function applyRules(flag, watch, made) {
 
 // ---------- helpers ----------
 const roundOrder = r => r.order || DEFAULT_ORDER;
+
+// Putts are just 1, 2, 3 now. Older rounds stored them per disc colour, so
+// these two read either shape and always hand back three slots in throw order.
+function puttsOf(r) {
+  if (Array.isArray(r.putts)) return r.putts.map(Boolean);
+  const order = roundOrder(r);
+  return order.map(k => !!(r.results || {})[k]);
+}
+function missOf(r) {
+  const m = r.miss || {};
+  if (Array.isArray(r.putts) || m[0] !== undefined || m[1] !== undefined || m[2] !== undefined) {
+    return [0, 1, 2].map(i => m[i] || null);
+  }
+  return roundOrder(r).map(k => m[k] || null);
+}
+const madeOf = r => (typeof r.made === "number" ? r.made : puttsOf(r).filter(Boolean).length);
 const pct = s => (s.a ? Math.round((100 * s.m) / s.a) + "%" : "—");
 const frac = s => (s.a ? `${s.m}/${s.a}` : "·");
 const fmtDate = ts => new Date(ts).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -79,19 +90,15 @@ const fmtClock = sec => {
 // streaks, and pace never bleed across session boundaries.
 function computeStats(segments) {
   const rounds = segments.flat();
-  const perFlag = {}, perColor = {}, grid = {}, perPos = [{ m: 0, a: 0 }, { m: 0, a: 0 }, { m: 0, a: 0 }];
-  for (let f = 1; f <= 5; f++) { perFlag[f] = { m: 0, a: 0 }; grid[f] = {}; DEFAULT_ORDER.forEach(k => grid[f][k] = { m: 0, a: 0 }); }
-  DEFAULT_ORDER.forEach(k => perColor[k] = { m: 0, a: 0 });
+  const perFlag = {}, perPos = [{ m: 0, a: 0 }, { m: 0, a: 0 }, { m: 0, a: 0 }];
+  for (let f = 1; f <= 5; f++) perFlag[f] = { m: 0, a: 0 };
   let highest = 0;
 
   rounds.forEach(r => {
     highest = Math.max(highest, r.flag);
-    roundOrder(r).forEach((k, i) => {
-      const hit = r.results[k] ? 1 : 0;
-      perFlag[r.flag].m += hit; perFlag[r.flag].a += 1;
-      perColor[k].m += hit; perColor[k].a += 1;
-      grid[r.flag][k].m += hit; grid[r.flag][k].a += 1;
-      perPos[i].m += hit; perPos[i].a += 1;
+    puttsOf(r).forEach((hit, i) => {
+      perFlag[r.flag].m += hit ? 1 : 0; perFlag[r.flag].a += 1;
+      perPos[i].m += hit ? 1 : 0; perPos[i].a += 1;
     });
   });
 
@@ -99,8 +106,8 @@ function computeStats(segments) {
   let bestStreak = 0;
   segments.forEach(seg => {
     let run = 0;
-    seg.forEach(r => roundOrder(r).forEach(k => {
-      run = r.results[k] ? run + 1 : 0;
+    seg.forEach(r => puttsOf(r).forEach(hit => {
+      run = hit ? run + 1 : 0;
       bestStreak = Math.max(bestStreak, run);
     }));
   });
@@ -121,24 +128,24 @@ function computeStats(segments) {
 
   // watch record: rounds entered while on watch
   let watchSaved = 0, watchLost = 0;
-  rounds.forEach(r => { if (r.prevWatch) (r.made >= 2 ? watchSaved++ : watchLost++); });
+  rounds.forEach(r => { if (r.prevWatch) (madeOf(r) >= 2 ? watchSaved++ : watchLost++); });
 
   // where the misses go
   const missDirs = { L: 0, R: 0, H: 0, Lo: 0, unknown: 0 };
   rounds.forEach(r => {
-    const dirs = r.miss || {};
-    roundOrder(r).forEach(k => {
-      if (r.results[k]) return;
-      const d = dirs[k];
+    const dirs = missOf(r);
+    puttsOf(r).forEach((hit, i) => {
+      if (hit) return;
+      const d = dirs[i];
       if (d && missDirs[d] !== undefined) missDirs[d] += 1; else missDirs.unknown += 1;
     });
   });
 
   // warm-up effect: first 3 rounds of each session vs the rest
   const early = { m: 0, a: 0 }, late = { m: 0, a: 0 };
-  segments.forEach(seg => seg.forEach((r, i) => roundOrder(r).forEach(k => {
+  segments.forEach(seg => seg.forEach((r, i) => puttsOf(r).forEach(hit => {
     const b = i < 3 ? early : late;
-    b.m += r.results[k] ? 1 : 0; b.a += 1;
+    b.m += hit ? 1 : 0; b.a += 1;
   })));
 
   // pace
@@ -146,12 +153,12 @@ function computeStats(segments) {
   const avgDur = durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null;
   const totalDur = durs.length ? durs.reduce((a, b) => a + b, 0) : null;
 
-  return { perFlag, perColor, grid, perPos, highest, total: rounds.length, bestStreak, adv, watchSaved, watchLost, avgDur, totalDur, early, late, missDirs };
+  return { perFlag, perPos, highest, total: rounds.length, bestStreak, adv, watchSaved, watchLost, avgDur, totalDur, early, late, missDirs };
 }
 
 function currentStreak(rounds) {
   let run = 0;
-  rounds.forEach(r => roundOrder(r).forEach(k => { run = r.results[k] ? run + 1 : 0; }));
+  rounds.forEach(r => puttsOf(r).forEach(hit => { run = hit ? run + 1 : 0; }));
   return run;
 }
 
@@ -187,7 +194,7 @@ function computePBs(sessions) {
 
 const aggAcc = segments => {
   let m = 0, a = 0;
-  segments.forEach(seg => seg.forEach(r => roundOrder(r).forEach(k => { m += r.results[k] ? 1 : 0; a += 1; })));
+  segments.forEach(seg => seg.forEach(r => puttsOf(r).forEach(hit => { m += hit ? 1 : 0; a += 1; })));
   return { m, a };
 };
 
@@ -243,8 +250,7 @@ function trendData(sessions) {
   const out = [], putts = [];
   sessions.forEach((s, idx) => {
     let m = 0, a = 0;
-    s.rounds.forEach(r => roundOrder(r).forEach(k => {
-      const hit = !!r.results[k];
+    s.rounds.forEach(r => puttsOf(r).forEach(hit => {
       putts.push(hit); m += hit ? 1 : 0; a += 1;
     }));
     const win = putts.slice(-ROLL_WINDOW);
@@ -267,10 +273,10 @@ function missAnalysis(rounds) {
   const all = blank(), byFlag = {};
   for (let f = 1; f <= 5; f++) byFlag[f] = blank();
   rounds.forEach(r => {
-    const dirs = r.miss || {};
-    roundOrder(r).forEach(k => {
-      if (r.results[k]) return;
-      const d = dirs[k];
+    const dirs = missOf(r);
+    puttsOf(r).forEach((hit, i) => {
+      if (hit) return;
+      const d = dirs[i];
       const bucket = d && all[d] !== undefined ? d : "prior";
       all[bucket] += 1; byFlag[r.flag][bucket] += 1;
     });
@@ -282,7 +288,7 @@ function missAnalysis(rounds) {
 
 const accOf = (rounds) => {
   let m = 0, a = 0;
-  rounds.forEach(r => roundOrder(r).forEach(k => { m += r.results[k] ? 1 : 0; a += 1; }));
+  rounds.forEach(r => puttsOf(r).forEach(hit => { m += hit ? 1 : 0; a += 1; }));
   return { m, a };
 };
 
@@ -313,7 +319,7 @@ function fatigueCurve(sessions) {
   sessions.forEach(s => s.rounds.forEach((r, i) => {
     const b = bands.find(x => i >= x.lo && i < x.hi);
     if (!b) return;
-    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+    puttsOf(r).forEach(hit => { b.m += hit ? 1 : 0; b.a += 1; });
   }));
   return bands.filter(b => b.a > 0);
 }
@@ -328,7 +334,7 @@ function paceEffect(sessions) {
   sessions.forEach(s => s.rounds.forEach(r => {
     if (typeof r.dur !== "number") return;
     const b = bands.find(x => r.dur < x.max);
-    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+    puttsOf(r).forEach(hit => { b.m += hit ? 1 : 0; b.a += 1; });
   }));
   return bands.filter(b => b.a > 0);
 }
@@ -356,7 +362,7 @@ function pressureSplit(sessions) {
   const on = { m: 0, a: 0 }, off = { m: 0, a: 0 };
   sessions.forEach(s => s.rounds.forEach(r => {
     const b = r.prevWatch ? on : off;
-    roundOrder(r).forEach(k => { b.m += r.results[k] ? 1 : 0; b.a += 1; });
+    puttsOf(r).forEach(hit => { b.m += hit ? 1 : 0; b.a += 1; });
   }));
   return { on, off };
 }
@@ -420,21 +426,9 @@ async function deleteKey(key) {
 
 // ---------- compact encoding for cloud backup ----------
 // Rounds squeeze down to a few numbers each so the synced file stays tiny.
-const ORDERS = [
-  ["orange", "red", "green"], ["orange", "green", "red"],
-  ["red", "orange", "green"], ["red", "green", "orange"],
-  ["green", "orange", "red"], ["green", "red", "orange"],
-];
-const orderIndex = (o) => {
-  const i = ORDERS.findIndex(x => x[0] === o[0] && x[1] === o[1] && x[2] === o[2]);
-  return i < 0 ? 0 : i;
-};
-
-// Miss directions pack into one small number: 3 slots x 3 bits, in throw order.
+// Miss directions pack into one small number: 3 slots x 3 bits.
 const DIR_CODE = { L: 1, R: 2, H: 3, Lo: 4 };
 const CODE_DIR = { 1: "L", 2: "R", 3: "H", 4: "Lo" };
-const packMiss = (order, miss = {}) =>
-  order.reduce((n, k, i) => n | ((DIR_CODE[miss[k]] || 0) << (i * 3)), 0);
 const unpackMiss = (order, code = 0) => {
   const out = {};
   order.forEach((k, i) => {
@@ -449,9 +443,10 @@ function packSession(s) {
     s: s.startedAt,
     e: s.endedAt || null,
     r: s.rounds.map(r => {
-      const o = roundOrder(r);
-      const bits = o.reduce((n, k, i) => n | (r.results[k] ? 1 << i : 0), 0);
-      return [r.flag, bits, Math.round(r.dur || 0), orderIndex(o), r.prevWatch ? 1 : 0, packMiss(o, r.miss)];
+      const putts = puttsOf(r), dirs = missOf(r);
+      const bits = putts.reduce((n, hit, i) => n | (hit ? 1 << i : 0), 0);
+      const mcode = dirs.reduce((n, d, i) => n | ((DIR_CODE[d] || 0) << (i * 3)), 0);
+      return [r.flag, bits, Math.round(r.dur || 0), 0, r.prevWatch ? 1 : 0, mcode];
     }),
   };
 }
@@ -459,12 +454,15 @@ function unpackSession(p) {
   return {
     startedAt: p.s,
     endedAt: p.e || undefined,
-    rounds: (p.r || []).map(([flag, bits, dur, oi, pw, mcode]) => {
-      const order = ORDERS[oi] || DEFAULT_ORDER;
-      const results = {};
-      order.forEach((k, i) => { results[k] = !!(bits & (1 << i)); });
-      const made = order.reduce((n, k) => n + (results[k] ? 1 : 0), 0);
-      return { flag, results, made, order, dur, prevFlag: flag, prevWatch: !!pw, miss: unpackMiss(order, mcode || 0) };
+    rounds: (p.r || []).map(([flag, bits, dur, _legacyOrder, pw, mcode]) => {
+      const putts = [0, 1, 2].map(i => !!(bits & (1 << i)));
+      const miss = {};
+      [0, 1, 2].forEach(i => { const d = CODE_DIR[((mcode || 0) >> (i * 3)) & 7]; if (d) miss[i] = d; });
+      return {
+        flag, putts, miss, dur,
+        made: putts.filter(Boolean).length,
+        prevFlag: flag, prevWatch: !!pw,
+      };
     }),
   };
 }
@@ -694,7 +692,7 @@ function Icon({ name, size = 15, style }) {
 function replaySession(rounds) {
   let flag = 1, watch = false;
   return rounds.map(r => {
-    const made = roundOrder(r).reduce((n, k) => n + (r.results[k] ? 1 : 0), 0);
+    const made = puttsOf(r).filter(Boolean).length;
     const out = { ...r, flag, made, prevFlag: flag, prevWatch: watch };
     const { nf, nw } = applyRules(flag, watch, made);
     flag = nf; watch = nw;
@@ -715,24 +713,20 @@ const DIR_LABEL = { L: "left", R: "right", H: "high", Lo: "low" };
 
 // One putt: a big MADE target, plus a compact four-way pad for where it missed.
 // The pad reads as one unit, so it never competes with MADE for attention.
-function PuttRow({ label, sub, tint, value, dir, onMade, onMiss, onHoist, canHoist }) {
+function PuttRow({ label, sub, value, dir, onMade, onMiss }) {
   const missed = value === false;
-  const Chip = canHoist ? "button" : "div";
+  const answered = value !== null && value !== undefined;
   return (
     <div className="flex-1 flex gap-2 min-h-0">
-      {/* the colour chip doubles as the reorder handle: tap to move this putter
-          up one slot, which reaches every order in at most two taps */}
-      <Chip
-        onClick={canHoist ? onHoist : undefined}
-        aria-label={canHoist ? `Move ${label} up one` : undefined}
-        className="relative flex flex-col items-center justify-center rounded-2xl"
-        style={{ width: 50, background: tint || "#EDEAE0", color: tint ? "#fff" : C.faint, border: "none" }}>
-        {canHoist && (
-          <span className="absolute" style={{ top: 4, ...disp, fontWeight: 800, fontSize: 12, opacity: 0.75 }}>↑</span>
-        )}
-        <span style={{ ...disp, fontWeight: 800, fontSize: 17, letterSpacing: "0.04em" }}>{label}</span>
-        {sub && <span style={{ fontSize: 10, opacity: 0.85 }}>{sub}</span>}
-      </Chip>
+      <div className="flex flex-col items-center justify-center rounded-2xl"
+        style={{
+          width: 46,
+          background: answered ? (value ? "#E4EFE7" : "#ECEDEA") : "#F1EFE7",
+          color: answered ? (value ? C.fairway : C.miss) : C.faint,
+        }}>
+        <span style={{ ...disp, fontWeight: 800, fontSize: 21, lineHeight: 1 }}>{label}</span>
+        {sub && <span style={{ fontSize: 9, letterSpacing: "0.06em", textTransform: "uppercase" }}>{sub}</span>}
+      </div>
 
       <button onClick={onMade} className="rounded-2xl"
         style={{
@@ -1256,17 +1250,6 @@ function StatsBody({ segments, distances = {} }) {
         </StatBlock>
       )}
 
-      <StatBlock title="By disc" icon="disc">
-        <div className="flex gap-2">
-          {DEFAULT_ORDER.map(k => (
-            <div key={k} className="flex-1 rounded-xl p-2 text-center" style={{ background: "#FAF8F2", border: `1px solid ${C.line}` }}>
-              <div className="mx-auto mb-1 rounded-full" style={{ width: 14, height: 14, background: DISC[k].color }} />
-              <div style={{ ...disp, fontWeight: 800, fontSize: 22, lineHeight: 1 }}>{pct(s.perColor[k])}</div>
-              <div style={{ fontSize: 11, color: C.faint }}>{frac(s.perColor[k])}</div>
-            </div>
-          ))}
-        </div>
-      </StatBlock>
 
       <StatBlock title="By throw position" icon="target">
         <div className="flex gap-2">
@@ -1279,30 +1262,6 @@ function StatsBody({ segments, distances = {} }) {
         </div>
       </StatBlock>
 
-      <StatBlock title="Disc × flag" icon="grid">
-        <table className="w-full" style={{ fontSize: 13 }}>
-          <thead>
-            <tr>
-              <th className="text-left pb-1" style={{ color: C.faint, fontWeight: 500 }}>Flag</th>
-              {DEFAULT_ORDER.map(k => (
-                <th key={k} className="pb-1">
-                  <div className="mx-auto rounded-full" style={{ width: 12, height: 12, background: DISC[k].color }} />
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {[1, 2, 3, 4, 5].map(f => (
-              <tr key={f} style={{ borderTop: `1px solid ${C.line}` }}>
-                <td className="py-1.5" style={{ ...disp, fontWeight: 700, fontSize: 16 }}>{f}</td>
-                {DEFAULT_ORDER.map(k => (
-                  <td key={k} className="py-1.5 text-center" style={{ color: s.grid[f][k].a ? C.ink : C.line }}>{frac(s.grid[f][k])}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </StatBlock>
     </>
   );
 }
@@ -1426,7 +1385,7 @@ export default function App() {
   const [tab, setTab] = useState("home"); // home | session | detail
   const [sessions, setSessions] = useState([]);
   const [active, setActive] = useState(null); // {startedAt, flag, watch, rounds, order, anchor}
-  const [pending, setPending] = useState({ orange: null, red: null, green: null });
+  const [pending, setPending] = useState([null, null, null]);
   const [pendingDir, setPendingDir] = useState({});
   const [throwFx, setThrowFx] = useState(null);
   const [gamePending, setGamePending] = useState([null, null, null]);
@@ -1687,57 +1646,36 @@ export default function App() {
     };
   }, []);
 
-  const lastUsedOrder = () => {
-    const last = sessions[sessions.length - 1];
-    const lastRound = last?.rounds?.[last.rounds.length - 1];
-    return lastRound ? roundOrder(lastRound) : DEFAULT_ORDER;
-  };
-
   const startSession = () => {
     const now = Date.now();
-    const a = { startedAt: now, flag: 1, watch: false, rounds: [], order: lastUsedOrder(), anchor: now, pending: null };
-    setActive(a); setPending({ orange: null, red: null, green: null });
+    const a = { startedAt: now, flag: 1, watch: false, rounds: [], anchor: now, pending: null };
+    setActive(a); setPending([null, null, null]);
     setBanner(null); setConfirmEnd(false); setView("session");
     saveKey("dg-active", a);
   };
 
   const resumeSession = () => {
     // restart the round clock so time away isn't charged to the next round
-    let restored = { orange: null, red: null, green: null };
+    let restored = [null, null, null];
     setActive(prev => {
-      restored = prev.pending || restored;
-      const next = { ...prev, order: prev.order || DEFAULT_ORDER, anchor: Date.now() };
+      if (Array.isArray(prev.pending)) restored = prev.pending;
+      const next = { ...prev, anchor: Date.now() };
       saveKey("dg-active", next);
       return next;
     });
     setPending(restored);
-    const n = DEFAULT_ORDER.filter(k => restored[k] !== null).length;
+    const n = restored.filter(v => v !== null).length;
     setBanner(n ? `Picked up mid-round — ${n} of 3 logged` : null);
     setConfirmEnd(false); setView("session");
   };
 
-  // move one putter up a slot; repeat taps reach any of the six orders
-  const hoist = (key) => {
+  const answer = (i, made, dir = null) => {
     if (committing.current) return;
-    setActive(prev => {
-      const order = [...(prev.order || DEFAULT_ORDER)];
-      const i = order.indexOf(key);
-      if (i <= 0) return prev;
-      [order[i - 1], order[i]] = [order[i], order[i - 1]];
-      const next = { ...prev, order };
-      saveKey("dg-active", next);
-      buzz([12]);
-      return next;
-    });
-  };
-
-  const answer = (key, made, dir = null) => {
-    if (committing.current) return;
-    const p = { ...pending, [key]: made };
+    const p = [...pending]; p[i] = made;
     const pd = { ...pendingDir };
-    if (made) delete pd[key]; else pd[key] = dir;
+    if (made) delete pd[i]; else pd[i] = dir;
     setPending(p); setPendingDir(pd); missDirRef.current = pd;
-    const complete = DEFAULT_ORDER.every(k => p[k] !== null);
+    const complete = p.every(v => v !== null);
     if (complete) {
       committing.current = true;
       setTimeout(() => commitRound(p), 350);
@@ -1755,13 +1693,12 @@ export default function App() {
     const dirs = { ...missDirRef.current };
     setActive(prev => {
       const now = Date.now();
-      const made = DEFAULT_ORDER.reduce((n, k) => n + (p[k] ? 1 : 0), 0);
+      const made = p.filter(Boolean).length;
       const { nf, nw, msg } = applyRules(prev.flag, prev.watch, made);
       const dur = Math.max(0, (now - (prev.anchor || prev.startedAt)) / 1000);
       const round = {
-        flag: prev.flag, results: { ...p }, miss: dirs, made,
-        prevFlag: prev.flag, prevWatch: prev.watch,
-        order: [...(prev.order || DEFAULT_ORDER)], dur, t: now,
+        flag: prev.flag, putts: [...p], miss: dirs, made,
+        prevFlag: prev.flag, prevWatch: prev.watch, dur, t: now,
       };
       const next = { ...prev, flag: nf, watch: nw, rounds: [...prev.rounds, round], anchor: now, pending: null };
       const pattern = nf > prev.flag ? [40, 60, 40, 60, 80] : nf < prev.flag ? [180] : made >= 2 ? [30] : [60, 50, 60];
@@ -1778,7 +1715,7 @@ export default function App() {
       });
       return next;
     });
-    setPending({ orange: null, red: null, green: null });
+    setPending([null, null, null]);
     setPendingDir({}); missDirRef.current = {};
     committing.current = false;
   };
@@ -1787,8 +1724,8 @@ export default function App() {
     if (!active || active.rounds.length === 0) return;
     const rounds = active.rounds.slice(0, -1);
     const last = active.rounds[active.rounds.length - 1];
-    const next = { ...active, flag: last.prevFlag, watch: last.prevWatch, rounds, order: roundOrder(last), anchor: Date.now(), pending: null };
-    setActive(next); setPending({ orange: null, red: null, green: null });
+    const next = { ...active, flag: last.prevFlag, watch: last.prevWatch, rounds, anchor: Date.now(), pending: null };
+    setActive(next); setPending([null, null, null]);
     setBanner(`Undid round ${active.rounds.length}`);
     saveKey("dg-active", next);
   };
@@ -1903,15 +1840,16 @@ export default function App() {
     if (dbConfiguredWith(ghRef.current)) setTimeout(() => syncNow(true), 400);
   };
 
-  const togglePutt = (sIdx, rIdx, disc) => {
+  const togglePutt = (sIdx, rIdx, puttIdx) => {
     const list = sessions.map((s, i) => {
       if (i !== sIdx) return s;
       const rounds = s.rounds.map((r, j) => {
         if (j !== rIdx) return r;
-        const results = { ...r.results, [disc]: !r.results[disc] };
-        const miss = { ...(r.miss || {}) };
-        if (results[disc]) delete miss[disc];
-        return { ...r, results, miss };
+        const putts = puttsOf(r).map((hit, k) => (k === puttIdx ? !hit : hit));
+        const dirs = missOf(r);
+        const miss = {};
+        dirs.forEach((d, k) => { if (d && !putts[k]) miss[k] = d; });
+        return { ...r, putts, miss, results: undefined, order: undefined, made: putts.filter(Boolean).length };
       });
       return { ...s, rounds: replaySession(rounds) };
     });
@@ -1957,8 +1895,7 @@ export default function App() {
 
   // ----- SESSION -----
   if (view === "session" && active) {
-    const order = roundOrder(active);
-    const answered = DEFAULT_ORDER.filter(k => pending[k] !== null).length;
+    const answered = pending.filter(v => v !== null).length;
     const streak = currentStreak(active.rounds);
     return shell(
       <div className="flex flex-col px-3 pt-3 pb-3" style={{ height: "100dvh" }}>
@@ -1986,7 +1923,6 @@ export default function App() {
         <FlightPath flag={active.flag} watch={active.watch}
           highest={Math.max(active.flag, ...active.rounds.map(r => r.flag), 1)}
           throwFx={throwFx} distances={distances}
-          colors={(throwFx?.order || order).map(k => DISC[k].color)}
           onFlightDone={() => setThrowFx(null)} />
         <div className="text-center mt-1 mb-1">
           <span style={{ ...disp, fontWeight: 800, fontSize: 38, lineHeight: 1 }}>FLAG {active.flag}</span>
@@ -2000,18 +1936,16 @@ export default function App() {
 
         {/* one row per putter, in throw order */}
         <div className="flex-1 flex flex-col gap-2 min-h-0">
-          {order.map((k, i) => (
+          {[0, 1, 2].map(i => (
             <PuttRow
-              key={k}
-              label={DISC[k].label}
-              sub={`#${i + 1}`}
-              tint={DISC[k].color}
-              value={pending[k]}
-              dir={pendingDir[k]}
-              canHoist={i > 0 && pending[k] === null}
-              onHoist={() => hoist(k)}
-              onMade={() => answer(k, true)}
-              onMiss={(d) => answer(k, false, d)}
+              key={i}
+              label={`${i + 1}`}
+              sub="putt"
+              tint={null}
+              value={pending[i] ?? null}
+              dir={pendingDir[i]}
+              onMade={() => answer(i, true)}
+              onMiss={(d) => answer(i, false, d)}
             />
           ))}
         </div>
@@ -2214,10 +2148,10 @@ export default function App() {
               <div key={ri} className="flex items-center gap-2 py-1.5" style={{ borderTop: ri ? `1px solid ${C.line}` : "none" }}>
                 <span style={{ ...disp, fontWeight: 700, fontSize: 15, width: 46, color: C.faint }}>F{r.flag}</span>
                 <div className="flex gap-1.5 flex-1">
-                  {roundOrder(r).map(k => {
-                    const hit = !!r.results[k];
+                  {puttsOf(r).map((hit, pi) => {
+                    const dirs = missOf(r);
                     return (
-                      <button key={k} onClick={() => togglePutt(detailIdx, ri, k)}
+                      <button key={pi} onClick={() => togglePutt(detailIdx, ri, pi)}
                         className="flex-1 rounded-lg py-2"
                         style={{
                           background: hit ? C.fairway : "#FAF8F2",
@@ -2225,7 +2159,7 @@ export default function App() {
                           border: `1.5px solid ${hit ? C.fairway : C.line}`,
                           ...disp, fontWeight: 700, fontSize: 14,
                         }}>
-                        {hit ? "made" : (r.miss?.[k] ? DIR_LABEL[r.miss[k]] : "miss")}
+                        {hit ? "made" : (dirs[pi] ? DIR_LABEL[dirs[pi]] : "miss")}
                       </button>
                     );
                   })}
@@ -2595,7 +2529,7 @@ export default function App() {
 
 // Exported for the test harness; unused by the app itself.
 export {
-  applyRules, replaySession, computeStats, missAnalysis, currentStreak,
+  applyRules, replaySession, computeStats, missAnalysis, currentStreak, puttsOf, missOf,
   packSession, unpackSession, packGame, unpackGame, packAll, unpackAll,
   gameScore, gameMakes, gameFlagTable, leaderboard, ceilingAnalysis,
   pressureSplit, timeOfDay, fatigueCurve, paceEffect, mergeRecords,

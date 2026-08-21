@@ -50,11 +50,11 @@ backups).
 
 ## The two modes
 
-**Session** is open-ended ladder practice: three putters a round, advance on
+**Session** is open-ended ladder practice: three putts a round, advance on
 3/3, repeat on 2/3, watch on 1/3, back a flag on 0/3. Play as long as you like,
 then end it for a post mortem.
 
-**Scored run** is the game. Same three putters, same ladder rules, but fixed at
+**Scored run** is the game. Same three putts, same ladder rules, but fixed at
 10 rounds (30 putts) and every make scores the flag number you threw it from —
 a make at flag 4 is 4 points. Since you always start at flag 1 and can only
 climb one flag per round, a perfect run is 120 points. Finished runs are ranked
