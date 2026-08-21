@@ -10,11 +10,16 @@ const eq = (name, got, want) => {
 };
 
 // helper: build a round the way the app does
-const R = (results, order = ["orange", "red", "green"], miss = {}, dur = 60) => ({
-  results, order, miss, dur,
-  made: order.reduce((n, k) => n + (results[k] ? 1 : 0), 0),
+// a round is three putts, optionally with miss directions keyed by slot
+const P = (a, b, c, miss = {}, dur = 60) => ({
+  putts: [!!a, !!b, !!c], miss, dur,
+  made: [a, b, c].filter(Boolean).length,
 });
-const M = (o, r, g) => ({ orange: !!o, red: !!r, green: !!g });
+// a legacy round, stored the old colour way, to prove old data still reads
+const LEGACY = (o, r, g, order = ["orange", "red", "green"], miss = {}) => ({
+  results: { orange: !!o, red: !!r, green: !!g }, order, miss,
+  made: [o, r, g].filter(Boolean).length,
+});
 
 console.log("\n— ladder rules —");
 eq("3/3 advances", A.applyRules(2, false, 3).nf, 3);
@@ -32,59 +37,55 @@ eq("3/3 clears watch", A.applyRules(2, true, 3).nw, false);
 
 console.log("\n— replay after an edit —");
 {
-  // 3/3 → 3/3 → 1/3 → 1/3(on watch, drops) → 0/3
-  const rounds = [
-    R(M(1, 1, 1)), R(M(1, 1, 1)), R(M(1, 0, 0)), R(M(1, 0, 0)), R(M(0, 0, 0)),
-  ];
+  const rounds = [P(1,1,1), P(1,1,1), P(1,0,0), P(1,0,0), P(0,0,0)];
   const rep = A.replaySession(rounds);
   eq("flags replay correctly", rep.map(r => r.flag), [1, 2, 3, 3, 2]);
   eq("watch replays correctly", rep.map(r => r.prevWatch), [false, false, false, true, false]);
   eq("made counts", rep.map(r => r.made), [3, 3, 1, 1, 0]);
 
-  // flip the second round's green putt to a miss → 2/3, so no advance to flag 3
-  const edited = rounds.map((r, i) => i === 1 ? R(M(1, 1, 0)) : r);
-  const rep2 = A.replaySession(edited);
-  eq("edit renumbers downstream flags", rep2.map(r => r.flag), [1, 2, 2, 2, 1]);
+  const edited = rounds.map((r, i) => i === 1 ? P(1,1,0) : r);
+  eq("edit renumbers downstream flags", A.replaySession(edited).map(r => r.flag), [1, 2, 2, 2, 1]);
 }
 
-console.log("\n— per-colour stats follow the disc, not the slot —");
+console.log("\n— throw position 1/2/3 —");
 {
-  // orange always makes; green always misses; order changes every round
-  const rounds = A.replaySession([
-    R(M(1, 1, 0), ["orange", "red", "green"]),
-    R(M(1, 0, 0), ["green", "orange", "red"]),
-    R(M(1, 1, 0), ["red", "green", "orange"]),
-  ]);
+  const rounds = A.replaySession([P(1,1,0), P(1,0,0), P(0,1,1)]);
   const st = A.computeStats([rounds]);
-  eq("orange 3/3 across reorders", [st.perColor.orange.m, st.perColor.orange.a], [3, 3]);
-  eq("green 0/3 across reorders", [st.perColor.green.m, st.perColor.green.a], [0, 3]);
-  eq("red 2/3 across reorders", [st.perColor.red.m, st.perColor.red.a], [2, 3]);
+  eq("putt 1 record", [st.perPos[0].m, st.perPos[0].a], [2, 3]);
+  eq("putt 2 record", [st.perPos[1].m, st.perPos[1].a], [2, 3]);
+  eq("putt 3 record", [st.perPos[2].m, st.perPos[2].a], [1, 3]);
+  eq("no colour stats remain", st.perColor === undefined && st.grid === undefined, true);
+}
 
-  // throw position must track the ORDER, not the colour
-  // r1 slots: orange(1) red(1) green(0) → pos 1,2 make, 3 miss
-  // r2 slots: green(0) orange(1) red(0)  → pos 2 makes
-  // r3 slots: red(1) green(0) orange(1)  → pos 1,3 make
-  eq("1st-throw record", [st.perPos[0].m, st.perPos[0].a], [2, 3]);
-  eq("2nd-throw record", [st.perPos[1].m, st.perPos[1].a], [2, 3]);
-  eq("3rd-throw record", [st.perPos[2].m, st.perPos[2].a], [1, 3]);
-  eq("totals line up", st.perPos.reduce((n, p) => n + p.m, 0), 5);
+console.log("\n— legacy colour-era rounds still read —");
+{
+  // old round: orange made, red miss(left), green made, thrown green-first
+  const old = LEGACY(1, 0, 1, ["green", "orange", "red"], { red: "L" });
+  eq("putts read in throw order", A.puttsOf(old), [true, true, false]);
+  eq("miss dirs read in throw order", A.missOf(old), [null, null, "L"]);
+  const st = A.computeStats([A.replaySession([old])]);
+  eq("legacy round counts 2/3", [st.perFlag[1].m, st.perFlag[1].a], [2, 3]);
+  eq("legacy miss lands in the right slot", st.missDirs.L, 1);
+  const mixed = A.computeStats([A.replaySession([old, P(1,1,1)])]);
+  eq("legacy and new rounds mix", mixed.total, 2);
+  eq("streak spans both eras", mixed.bestStreak, 3);
 }
 
 console.log("\n— per-flag stats —");
 {
-  const rounds = A.replaySession([R(M(1, 1, 1)), R(M(1, 1, 0)), R(M(0, 0, 0))]);
+  const rounds = A.replaySession([P(1,1,1), P(1,1,0), P(0,0,0)]);
   // flag 1: 3/3, flag 2: 2/3 then 0/3 → 2/6
   const st = A.computeStats([rounds]);
   eq("flag 1 counts", [st.perFlag[1].m, st.perFlag[1].a], [3, 3]);
   eq("flag 2 counts", [st.perFlag[2].m, st.perFlag[2].a], [2, 6]);
   eq("highest flag", st.highest, 2);
-  eq("disc x flag grid", [st.grid[2].orange.m, st.grid[2].orange.a], [1, 2]);
+
 }
 
 console.log("\n— streaks —");
 {
   // order matters: streak counts putts in throw order across rounds
-  const rounds = A.replaySession([R(M(0, 1, 1)), R(M(1, 1, 0))]);
+  const rounds = A.replaySession([P(0,1,1), P(1,1,0)]);
   const st = A.computeStats([rounds]);
   eq("best streak spans the round boundary", st.bestStreak, 4);
   eq("current streak ends at last miss", A.currentStreak(rounds), 0);
@@ -93,9 +94,9 @@ console.log("\n— streaks —");
 console.log("\n— miss directions —");
 {
   const rounds = A.replaySession([
-    R(M(1, 0, 0), ["orange", "red", "green"], { red: "L", green: "L" }),
-    R(M(0, 0, 1), ["orange", "red", "green"], { orange: "R", red: "H" }),
-    R(M(1, 1, 0), ["orange", "red", "green"], {}),  // undirected: counts as Prior
+    P(1,0,0, { 1: "L", 2: "L" }),
+    P(0,0,1, { 0: "R", 1: "H" }),
+    P(1,1,0, {}),  // undirected: counts as Prior
   ]);
   const m = A.missAnalysis(rounds);
   eq("left tally", m.all.L, 2);
@@ -110,7 +111,7 @@ console.log("\n— miss directions —");
 
 console.log("\n— pressure and ceiling —");
 {
-  const rounds = A.replaySession([R(M(1, 0, 0)), R(M(1, 1, 0)), R(M(1, 1, 1))]);
+  const rounds = A.replaySession([P(1,0,0), P(1,1,0), P(1,1,1)]);
   const sessions = [{ startedAt: Date.now(), rounds }];
   const p = A.pressureSplit(sessions);
   // round 2 is the only one thrown while on watch (round 1 was 1/3)
@@ -125,20 +126,18 @@ console.log("\n— pressure and ceiling —");
 console.log("\n— sync round-trip must lose nothing —");
 {
   const rounds = A.replaySession([
-    R(M(1, 0, 0), ["green", "orange", "red"], { orange: "L", red: "Lo" }, 42),
-    R(M(1, 1, 1), ["red", "green", "orange"], {}, 88),
+    P(1,0,0, { 1: "L", 2: "Lo" }, 42),
+    P(1,1,1, {}, 88),
   ]);
   const s = { startedAt: 1700000000000, endedAt: 1700000500000, rounds };
   const back = A.unpackSession(A.packSession(s));
   eq("round count", back.rounds.length, 2);
-  const norm = (x) => ["orange", "red", "green"].map(k => !!x[k]);
-  eq("results survive", norm(back.rounds[0].results), norm(rounds[0].results));
-  eq("throw order survives", back.rounds[0].order, ["green", "orange", "red"]);
-  eq("miss directions survive", back.rounds[0].miss, { orange: "L", red: "Lo" });
+  eq("putts survive", A.puttsOf(back.rounds[0]), [true, false, false]);
+  eq("miss directions survive", A.missOf(back.rounds[0]), [null, "L", "Lo"]);
   eq("duration survives", back.rounds[0].dur, 42);
   eq("stats identical after round-trip",
-    A.computeStats([back.rounds]).perColor,
-    A.computeStats([rounds]).perColor);
+    A.computeStats([back.rounds]).perPos,
+    A.computeStats([rounds]).perPos);
   eq("miss analysis identical after round-trip",
     A.missAnalysis(back.rounds).all, A.missAnalysis(rounds).all);
 }
@@ -169,7 +168,7 @@ console.log("\n— scored runs —");
 
 console.log("\n— merge (two devices) —");
 {
-  const mk = (t, n) => ({ startedAt: t, rounds: Array.from({ length: n }, () => R(M(1, 1, 1))) });
+  const mk = (t, n) => ({ startedAt: t, rounds: Array.from({ length: n }, () => P(1,1,1)) });
   const local = [mk(1, 2), mk(2, 3)];
   const remote = [mk(2, 3), mk(3, 1)];
   const merged = A.mergeRecords(local, remote, x => x.rounds.length);
